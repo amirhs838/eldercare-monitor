@@ -1,0 +1,14 @@
+{
+  "inactivity_enabled": false,
+  "care_plan_id": "",
+  "nonrest_checkin_s": 900.0,
+  "rest_checkin_s": null,
+  "expected_presence": false,
+  "coverage_checkin_s": 15.0,
+  "min_pose_quality": 0.6,
+  "motion_threshold": 0.15,
+  "movement_reset_s": 2.0,
+  "max_gap_s": 0.65,
+  "ack_timeout_s": 60.0,
+  "resolution_reminder_s": 300.0
+}

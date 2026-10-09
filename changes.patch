@@ -1,0 +1,1872 @@
+--- /dev/null
++++ b/care_config.example.json
+@@ -0,0 +1,14 @@
++{
++  "inactivity_enabled": true,
++  "care_plan_id": "EXAMPLE_ONLY_REPLACE_WITH_APPROVED_PLAN",
++  "nonrest_checkin_s": 900.0,
++  "rest_checkin_s": null,
++  "expected_presence": false,
++  "coverage_checkin_s": 15.0,
++  "min_pose_quality": 0.6,
++  "motion_threshold": 0.15,
++  "movement_reset_s": 2.0,
++  "max_gap_s": 0.65,
++  "ack_timeout_s": 60.0,
++  "resolution_reminder_s": 300.0
++}
+--- /dev/null
++++ b/care_config.json
+@@ -0,0 +1,14 @@
++{
++  "inactivity_enabled": false,
++  "care_plan_id": "",
++  "nonrest_checkin_s": 900.0,
++  "rest_checkin_s": null,
++  "expected_presence": false,
++  "coverage_checkin_s": 15.0,
++  "min_pose_quality": 0.6,
++  "motion_threshold": 0.15,
++  "movement_reset_s": 2.0,
++  "max_gap_s": 0.65,
++  "ack_timeout_s": 60.0,
++  "resolution_reminder_s": 300.0
++}
+--- /dev/null
++++ b/care_policy.py
+@@ -0,0 +1,152 @@
++"""Context-aware *review* policy, not sleep/medical inference.
++
++No learned personal baseline, resident identification or clinical thresholds.
++Times below are illustrative engineering settings requiring a signed care plan.
++"""
++from dataclasses import asdict, dataclass
++import json
++import math
++from pathlib import Path
++
++from engine import Decision
++
++
++@dataclass
++class CareConfig:
++    inactivity_enabled: bool = False
++    care_plan_id: str = ''
++    nonrest_checkin_s: float = 900.0
++    rest_checkin_s: float | None = None  # None: no stillness-only alert in rest region
++    expected_presence: bool = False
++    coverage_checkin_s: float = 15.0
++    min_pose_quality: float = .60
++    motion_threshold: float = .15
++    movement_reset_s: float = 2.0
++    max_gap_s: float = .65
++    ack_timeout_s: float = 60.0
++    resolution_reminder_s: float = 300.0
++
++    def validate(self):
++        if type(self.inactivity_enabled) is not bool or type(self.expected_presence) is not bool:
++            raise ValueError('Policy enable flags must be JSON booleans')
++        if not isinstance(self.care_plan_id, str) or len(self.care_plan_id) > 128:
++            raise ValueError('care_plan_id must be a short non-sensitive label')
++        if (self.inactivity_enabled or self.expected_presence) and not self.care_plan_id.strip():
++            raise ValueError('Personalized policies require care_plan_id and approved site thresholds')
++        for key, value in asdict(self).items():
++            if key in ('inactivity_enabled','expected_presence','care_plan_id'):
++                continue
++            if key == 'rest_checkin_s' and value is None:
++                continue
++            if isinstance(value, bool) or not isinstance(value, (int,float)) or not math.isfinite(value) or value <= 0:
++                raise ValueError(f'{key} must be finite and positive')
++        if self.min_pose_quality > 1:
++            raise ValueError('min_pose_quality must be <=1')
++        if self.rest_checkin_s is not None and self.rest_checkin_s < self.nonrest_checkin_s:
++            raise ValueError('rest_checkin_s must not be shorter than nonrest_checkin_s')
++
++    @classmethod
++    def load(cls, path=None):
++        data = json.loads(Path(path).read_text(encoding='utf-8')) if path else {}
++        if not isinstance(data,dict) or set(data)-set(cls.__dataclass_fields__):
++            raise ValueError('Invalid or unknown care policy fields')
++        obj = cls(**data)
++        obj.validate()
++        return obj
++
++
++@dataclass(frozen=True)
++class Signal:
++    family: str
++    priority: str
++    reason: str
++
++
++class CarePolicy:
++    def __init__(self, cfg: CareConfig):
++        cfg.validate()
++        self.cfg = cfg
++        self.last_t = None
++        self.context = None
++        self.still_observed_s = 0.
++        self.was_still = False
++        self.sent_inactivity = False
++        self.moving_since = None
++        self.unknown_since = None
++        self.coverage_sent = False
++        self.ambiguity_since = None
++        self.ambiguity_sent = False
++        self.pending_descent = False
++
++    def update(self, t: float, d: Decision, *, absent=False) -> list[Signal]:
++        if not math.isfinite(t) or (self.last_t is not None and t <= self.last_t):
++            raise ValueError('Policy time must be finite and increasing')
++        cfg = self.cfg
++        dt = 0. if self.last_t is None else t-self.last_t
++        self.last_t = t
++        out = []
++        if 'rapid_descent' in d.events:
++            self.pending_descent = True
++        if 'possible_fall' in d.events or 'prolonged_floor_lying' in d.events:
++            out.append(Signal('safety','urgent',';'.join(e for e in d.events if e in {'possible_fall','prolonged_floor_lying'})))
++            self.pending_descent = False
++        elif 'descent_unconfirmed' in d.events:
++            out.append(Signal('safety','review','rapid_descent_unconfirmed;including_bed_or_chair;not_evidence_of_safety'))
++            self.pending_descent = False
++        usable = (d.posture != 'unknown' and d.pose_quality is not None
++                  and d.pose_quality >= cfg.min_pose_quality)
++        if not usable:
++            if self.pending_descent:
++                out.append(Signal('safety','review','observation_lost_during_descent;manual_check_required'))
++                self.pending_descent = False
++            if self.unknown_since is None:
++                self.unknown_since = t
++            # Disappearance may simply be leaving a room. Require a care plan
++            # to treat absence as abnormal; visible low-quality pose is a technical gap.
++            should_check = not absent or cfg.expected_presence
++            if should_check and not self.coverage_sent and t-self.unknown_since >= cfg.coverage_checkin_s:
++                out.append(Signal('coverage','review','observation_unavailable;not_stillness_or_safety'))
++                self.coverage_sent = True
++        else:
++            self.unknown_since = None
++            self.coverage_sent = False
++        if d.zone_ambiguous:
++            if self.ambiguity_since is None:
++                self.ambiguity_since = t
++            if not self.ambiguity_sent and t-self.ambiguity_since >= cfg.coverage_checkin_s:
++                out.append(Signal('calibration','review','body_straddles_zones_or_overlapping_regions;location_uncertain'))
++                self.ambiguity_sent = True
++        else:
++            self.ambiguity_since = None
++            self.ambiguity_sent = False
++        if not cfg.inactivity_enabled:
++            return out
++        # Rest is a location/posture context, not a diagnosis or time-of-day blackout.
++        context = ('rest' if (d.in_bed or d.in_chair) and d.posture in ('lying','sitting')
++                   else 'nonrest')
++        known = usable and not d.zone_ambiguous and d.motion_speed is not None and math.isfinite(d.motion_speed)
++        if not known or dt > cfg.max_gap_s or context != self.context:
++            self.still_observed_s = 0.
++            self.was_still = False
++            self.moving_since = None
++            # Keep an emitted episode latched through gaps. Not knowing is not recovery.
++        self.context = context
++        still = known and d.motion_speed <= cfg.motion_threshold
++        if still:
++            self.moving_since = None
++            if self.was_still and dt <= cfg.max_gap_s:
++                self.still_observed_s += dt
++            threshold = cfg.rest_checkin_s if context == 'rest' else cfg.nonrest_checkin_s
++            if threshold is not None and self.still_observed_s >= threshold and not self.sent_inactivity:
++                out.append(Signal('inactivity','review',f'care_plan_checkin;context={context};not_unconsciousness'))
++                self.sent_inactivity = True
++        elif known:
++            self.still_observed_s = 0.
++            # One noisy/moving joint sample cannot rearm an already emitted episode.
++            if self.moving_since is None:
++                self.moving_since = t
++            if t-self.moving_since >= cfg.movement_reset_s:
++                self.still_observed_s = 0.
++                self.sent_inactivity = False
++        self.was_still = still
++        return out
+--- a/config.json
++++ b/config.json
+@@ -21,6 +21,7 @@
+   "fall_candidate_timeout_s": 2.5,
+   "fall_cooldown_s": 5.0,
+   "recovery_s": 2.0,
++  "floor_lying_alert_s": 30.0,
+   "sway_window_s": 3.0,
+   "sway_min_duration_s": 2.0,
+   "sway_amplitude": 0.22,
+@@ -30,5 +31,5 @@
+   "track_ttl_s": 5.0,
+   "bed_polygon": [],
+   "floor_polygon": [],
+-  "floor_lying_alert_s": 30.0
++  "chair_polygon": []
+ }
+--- /dev/null
++++ b/delivery.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""Independent durable HTTPS notification dispatcher and vision heartbeat watchdog.
++
++Run as a separate supervised process. Endpoint must authenticate Bearer tokens,
++validate events and deduplicate Idempotency-Key. A 2xx is only a transport receipt.
++No SMS, phone call or human acknowledgement is simulated by this implementation.
++"""
++import argparse
++import json
++import math
++import os
++import sys
++import time
++from urllib.parse import urlsplit
++from urllib.request import HTTPRedirectHandler, Request, build_opener
++
++from incidents import IncidentStore
++
++
++class NoRedirects(HTTPRedirectHandler):
++    def redirect_request(self,req,fp,code,msg,headers,newurl):
++        return None  # never forward credentials through a redirect
++
++
++class HTTPSender:
++    def __init__(self,url,token):
++        parts=urlsplit(url)
++        if (parts.scheme!='https' or not parts.hostname or parts.username or parts.password
++                or parts.fragment or parts.query):
++            raise ValueError('Use an approved HTTPS endpoint without URL credentials/query/fragment')
++        if not token or any(c in token for c in '\r\n'):
++            raise ValueError('A Bearer token from the environment is required')
++        self.url,self.token=url,token
++        self.opener=build_opener(NoRedirects())
++
++    def send(self,message):
++        req=Request(self.url,data=message['payload'].encode('utf-8'),method='POST',headers={
++            'Content-Type':'application/json','Authorization':f'Bearer {self.token}',
++            'Idempotency-Key':message['id']})
++        with self.opener.open(req,timeout=8) as response:
++            return 200<=response.status<300
++
++
++def deliver_one(store,sender,now=None):
++    message=store.claim(now,lease_s=30.)
++    if message is None: return False
++    error=''
++    try:
++        success=bool(sender.send(message))
++        if not success: error='NonSuccessResponse'
++    except Exception as exc:
++        success=False
++        error=type(exc).__name__  # never log URL, secret or response body
++    store.delivery_result(message['id'],message['lease_token'],success,error,now)
++    return True
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--db',required=True)
++    p.add_argument('--watch-site',help='Must match live monitor --site-id; do not watch offline replay')
++    p.add_argument('--stale-seconds',type=float,default=30.)
++    p.add_argument('--interval',type=float,default=1.)
++    p.add_argument('--once',action='store_true')
++    args=p.parse_args()
++    if any(not math.isfinite(v) or v<=0 for v in (args.interval,args.stale_seconds)):
++        p.error('Intervals must be finite and positive')
++    sender=None
++    if os.environ.get('ELDERCARE_WEBHOOK_URL'):
++        sender=HTTPSender(os.environ['ELDERCARE_WEBHOOK_URL'],os.environ.get('ELDERCARE_WEBHOOK_TOKEN',''))
++    else:
++        print('NO DELIVERY CONFIGURED: incidents remain queued locally; no caregiver is notified.',file=sys.stderr)
++    store=IncidentStore(args.db)
++    try:
++        while True:
++            if args.watch_site:
++                store.check_heartbeat(args.watch_site,args.stale_seconds)
++            store.tick()
++            if sender:
++                # Bound work so the watchdog cannot be starved by a large backlog.
++                deliver_one(store,sender)
++            if args.once:
++                print(json.dumps(store.delivery_status()))
++                break
++            time.sleep(args.interval)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        store.close()
++
++
++if __name__=='__main__':
++    try: main()
++    except Exception as exc:
++        print(f'Dispatcher stopped: {type(exc).__name__}; check protected configuration.',file=sys.stderr)
++        sys.exit(2)
+--- a/engine.py
++++ b/engine.py
+@@ -1,4 +1,4 @@
+-"""Temporal pose heuristics. Experimental, NOT a medical/safety device.
++"""Temporal pose heuristics. Engineering prototype, NOT a validated medical/safety device.
+ 
+ COCO-17 coordinates are pixel coordinates in the original frame. No training,
+ probability calibration, face recognition, or diagnosis is performed here.
+@@ -47,22 +47,23 @@
+     sway_min_reversals: int = 2
+     log_interval_s: float = 1.0
+     track_ttl_s: float = 5.0
+-    # Normalized [x,y] vertices, 0..1. Empty bed disables possible_sleep.
++    # Normalized [x,y] vertices, 0..1. Empty bed disables resting_in_bed.
+     # Bed must outline the BED SURFACE. Floor must outline VISIBLE FLOOR.
+     bed_polygon: list[list[float]] = field(default_factory=list)
+     floor_polygon: list[list[float]] = field(default_factory=list)
++    chair_polygon: list[list[float]] = field(default_factory=list)
+ 
+     def validate(self) -> None:
+-        if isinstance(self.floor_lying_alert_s, bool):
+-            raise ValueError('floor_lying_alert_s must be a number, not boolean')
++
+         for key, val in asdict(self).items():
+             if key.endswith('_polygon'):
+-                if val and (len(val) < 3 or any(len(p) != 2 or any(
+-                        not isinstance(x, (float, int)) or not math.isfinite(x)
+-                        or not 0 <= x <= 1 for x in p) for p in val)):
+-                    raise ValueError(f'{key}: expected >=3 normalized [x,y] vertices')
+-            elif not isinstance(val, (float, int)) or not math.isfinite(val) or val <= 0:
+-                raise ValueError(f'{key} must be finite and positive')
++                validate_polygon(val, key)
++            elif isinstance(val, bool) or not isinstance(val, (float, int)) or not math.isfinite(val) or val <= 0:
++                raise ValueError(f'{key} must be finite and positive, not boolean')
++        if not isinstance(self.sway_min_reversals, int):
++            raise ValueError('sway_min_reversals must be an integer')
++        if not 0 < self.lying_angle_deg < 90 or self.sitting_knee_deg >= 180:
++            raise ValueError('Invalid posture angle threshold')
+         if self.keypoint_conf > 1:
+             raise ValueError('keypoint_conf must be <= 1')
+         if self.history_s < max(self.sway_window_s, self.fall_lookback_s, 1.0):
+@@ -79,12 +80,42 @@
+     @classmethod
+     def load(cls, path: Optional[str]) -> 'Config':
+         data = json.loads(Path(path).read_text(encoding='utf-8')) if path else {}
++        if not isinstance(data, dict):
++            raise ValueError('Configuration must be a JSON object')
+         unknown = set(data) - set(cls.__dataclass_fields__)
+         if unknown:
+             raise ValueError(f'Unknown configuration fields: {sorted(unknown)}')
+         c = cls(**data)
+         c.validate()
+         return c
++
++
++def validate_polygon(poly, name='polygon'):
++    """Reject malformed, degenerate and self-intersecting image regions."""
++    if not isinstance(poly, list):
++        raise ValueError(f'{name}: expected a list')
++    if not poly:
++        return
++    if len(poly) < 3 or any(not isinstance(p, list) or len(p) != 2 or any(
++        isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
++        or not 0 <= v <= 1 for v in p) for p in poly):
++        raise ValueError(f'{name}: expected >=3 normalized [x,y] vertices')
++    if len(set(map(tuple, poly))) != len(poly):
++        raise ValueError(f'{name}: repeated vertex (do not repeat first point)')
++    area = sum(a[0]*b[1]-b[0]*a[1] for a,b in zip(poly, poly[1:]+poly[:1]))
++    if abs(area) < 1e-8:
++        raise ValueError(f'{name}: zero area')
++    def cross(a,b,c):
++        return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
++    def on(a,b,c):
++        return abs(cross(a,b,c)) < 1e-10 and all(min(a[i],b[i])-1e-10 <= c[i] <= max(a[i],b[i])+1e-10 for i in (0,1))
++    edges = list(zip(poly,poly[1:]+poly[:1]))
++    for i,(a,b) in enumerate(edges):
++        for j,(c,d) in enumerate(edges):
++            if j <= i+1 or (i==0 and j==len(edges)-1):
++                continue
++            if (cross(a,b,c)*cross(a,b,d)<0 and cross(c,d,a)*cross(c,d,b)<0) or any((on(a,b,c),on(a,b,d),on(c,d,a),on(c,d,b))):
++                raise ValueError(f'{name}: self-intersection')
+ 
+ 
+ def in_polygon(point: np.ndarray, polygon: list[list[float]]) -> bool:
+@@ -129,6 +160,8 @@
+     visible: np.ndarray
+     bed: bool
+     floor: bool
++    chair: bool = False
++    zone_ambiguous: bool = False
+ 
+ 
+ def extract_feature(t: float, keypoints: np.ndarray, bbox: np.ndarray,
+@@ -140,7 +173,9 @@
+     width, height = frame_wh
+     if width <= 0 or height <= 0 or b[2] <= b[0] or b[3] <= b[1]:
+         return None
+-    valid = np.isfinite(k).all(axis=1) & (k[:, 2] >= cfg.keypoint_conf)
++    if not math.isfinite(t):
++        return None
++    valid = np.isfinite(k).all(axis=1) & (k[:, 2] >= cfg.keypoint_conf) & (k[:, 2] <= 1)
+     valid &= (k[:, 0] >= 0) & (k[:, 0] < width) & (k[:, 1] >= 0) & (k[:, 1] < height)
+     # Same-side shoulder/hip pairs reduce false tilt under one-sided occlusion.
+     sides = [(s, h) for s, h in [(5, 11), (6, 12)] if valid[s] and valid[h]]
+@@ -164,14 +199,18 @@
+             v = knee_angle(k[h, :2], k[n, :2], k[a, :2])
+             if math.isfinite(v):
+                 knees.append(v)
+-    center = (hip + shoulder) / 2 / np.array([width, height])
++    anchors = [hip / [width, height], shoulder / [width, height],
++               (hip + shoulder) / 2 / [width, height]]
++    memberships = [[in_polygon(a, poly) for a in anchors]
++                   for poly in (cfg.bed_polygon, cfg.floor_polygon, cfg.chair_polygon)]
++    bed, floor, chair = [all(m) for m in memberships]
++    ambiguous = sum(any(m) for m in memberships) > 1 or any(any(m) and not all(m) for m in memberships)
+     q = float(np.mean([k[i, 2] for pair in sides for i in pair]))
+     return Feature(t, hip, shoulder, torso, angle, roll,
+                    float((b[2] - b[0]) / (b[3] - b[1])),
+                    float(np.median(knees)) if knees else None,
+                    float(np.median(thighs)) if thighs else None,
+-                   q, k[:, :2].copy(), valid, in_polygon(center, cfg.bed_polygon),
+-                   in_polygon(center, cfg.floor_polygon))
++                   q, k[:, :2].copy(), valid, bed, floor, chair, ambiguous)
+ 
+ 
+ @dataclass
+@@ -191,11 +230,15 @@
+     in_floor: bool = False
+     floor_lying_observed_s: float = 0.0
+     floor_lying_alert_active: bool = False
++    in_chair: bool = False
++    zone_ambiguous: bool = False
++    fall_alert_active: bool = False
+ 
+ 
+ class TemporalMonitor:
+     """One monitor per tracker ID. All time values are monotonic source seconds."""
+     def __init__(self, cfg: Config):
++        cfg.validate()
+         self.cfg = cfg
+         self.history: deque[Feature] = deque(maxlen=2000)
+         self.state = 'unknown'
+@@ -226,7 +269,8 @@
+         return Decision(
+             reason=reason + (';previous_fall_unresolved' if self.fall_latched else '')
+             + (';floor_lying_alert_unresolved' if self.floor_lying_latched else ''),
+-            floor_lying_alert_active=self.floor_lying_latched)
++            floor_lying_alert_active=self.floor_lying_latched,
++            fall_alert_active=self.fall_latched)
+ 
+     def _floor_lying(self, t: float, on_floor: bool, upright_or_sitting: bool,
+                      events: list[str]) -> float:
+@@ -282,7 +326,20 @@
+             if len(a) >= max(1, n // 2) and len(b) >= max(1, n // 2):
+                 motions.append(np.linalg.norm(np.median(b, axis=0) - np.median(a, axis=0))
+                                / max(dt * scale, 1e-9))
+-        return float(np.mean(motions)) if motions else float('inf')
++        if not motions:
++            return float('inf')
++        displacement = float(np.mean(motions))
++        # Endpoint-only displacement can report stillness after a complete cycle.
++        chunks = [items[i:i+max(1,len(items)//4)] for i in range(0,len(items),max(1,len(items)//4))]
++        path_speeds = []
++        for joint in indices:
++            centers = [(float(np.mean([f.t for f in ch])), np.median([f.points[joint] for f in ch if f.visible[joint]],axis=0))
++                       for ch in chunks if all(f.visible[joint] for f in ch)]
++            if len(centers) >= 3:
++                distance = sum(max(0., float(np.linalg.norm(b[1]-a[1]))-0.02*scale)
++                               for a,b in zip(centers,centers[1:]))
++                path_speeds.append(distance / max((centers[-1][0]-centers[0][0])*scale,1e-9))
++        return max(displacement, float(np.mean(path_speeds)) if path_speeds else 0.)
+ 
+     def _sway(self, t: float, scale: float) -> tuple[bool, float]:
+         cfg = self.cfg
+@@ -328,6 +385,13 @@
+                 raise ValueError('Source timestamps must increase strictly')
+             if t - self.last_t > cfg.max_gap_s:
+                 self.missing(t, 'sampling_gap')
++        if self.history:
++            prev = self.history[-1]
++            ratio = f.torso / prev.torso
++            jump = float(np.linalg.norm(f.hip-prev.hip)) / max(prev.torso, f.torso)
++            if jump > 4 or not .4 <= ratio <= 2.5:
++                # Preserve incident latches; discard this ambiguous observation.
++                return self.missing(t, 'identity_or_geometry_discontinuity')
+         self.last_t = t
+         self.history.append(f)
+         while self.history and t - self.history[0].t > cfg.history_s:
+@@ -351,17 +415,19 @@
+                                (math.isfinite(feet) and feet > cfg.foot_motion_speed))
+         swaying, amplitude = self._sway(t, scale)
+         unsteady = upright and swaying and (walking or motion > 0.18)
+-        activity = 'unsteady_gait' if unsteady else 'walking' if walking else 'still' if posture != 'unknown' else 'unknown'
+-        desired = 'unsteady_gait' if unsteady else 'walking' if walking else posture
++        activity = ('possible_postural_sway' if unsteady else 'walking' if walking
++                    else 'unknown' if posture == 'unknown' or not math.isfinite(motion)
++                    else 'still' if motion <= cfg.still_motion_speed else 'moving')
++        desired = 'possible_postural_sway' if unsteady else 'walking' if walking else posture
+         events: list[str] = []
+         reasons = ['temporal_heuristic_not_calibrated']
+ 
+-        if horizontal and f.bed and motion <= cfg.still_motion_speed:
++        if horizontal and f.bed and not f.zone_ambiguous and motion <= cfg.still_motion_speed:
+             if self.still_since is None:
+                 self.still_since = t
+             if t - self.still_since >= cfg.sleep_still_s:
+-                desired = 'possible_sleep'
+-                reasons.append('prolonged_still_lying_in_bed_not_sleep_confirmation')
++                desired = 'resting_in_bed'
++                reasons.append('observed_rest_not_sleep_or_wellness_confirmation')
+         else:
+             self.still_since = None
+ 
+@@ -381,14 +447,14 @@
+                     self.fall_since = t
+                     events.append('rapid_descent')
+                     if down_speed >= cfg.collapse_speed:
+-                        events.append('possible_collapse')
++                        events.append('rapid_descent_high_speed')
+                     reasons.append('rapid_downward_body_motion_not_diagnosis')
+                     break
+ 
+         if self.fall_since is not None:
+             desired = 'falling'
+             # A horizontal torso alone does not prove contact with the floor.
+-            location_ok = not f.bed and (f.floor or not cfg.floor_polygon)
++            location_ok = bool(cfg.floor_polygon) and f.floor and not (f.bed or f.chair or f.zone_ambiguous)
+             if horizontal and location_ok:
+                 if self.horizontal_since is None:
+                     self.horizontal_since = t
+@@ -398,13 +464,13 @@
+                     self.last_fall_t = t
+                     self.fall_since = self.horizontal_since = None
+                     desired = 'lying_after_fall'
+-                    if not cfg.floor_polygon:
+-                        reasons.append('floor_region_not_configured')
+             else:
+                 self.horizontal_since = None
+             if self.fall_since is not None and t - self.fall_since > cfg.fall_candidate_timeout_s:
+                 self.fall_since = self.horizontal_since = None
+                 events.append('descent_unconfirmed')
++                self.last_fall_t = t
++                reasons.append('unconfirmed_descent_requires_context_review_not_safe')
+                 desired = posture
+ 
+         if self.fall_latched:
+@@ -424,7 +490,7 @@
+                 reasons.append('previous_fall_unresolved')
+ 
+         # Strict floor gate; a blank floor polygon must never mean whole room.
+-        on_floor = horizontal and bool(cfg.floor_polygon) and f.floor and not f.bed
++        on_floor = horizontal and bool(cfg.floor_polygon) and f.floor and not (f.bed or f.chair or f.zone_ambiguous)
+         floor_duration = self._floor_lying(t, on_floor, upright or sitting, events)
+         if on_floor:
+             reasons.append(f'floor_lying_observed_s={floor_duration:.3f}')
+@@ -435,6 +501,11 @@
+         if 'floor_lying_ended' in events:
+             reasons.append('sustained_non_lying_posture_not_medical_recovery')
+ 
++        if f.zone_ambiguous:
++            reasons.append('zone_boundary_or_overlap_ambiguous')
++        if horizontal and f.chair and not f.zone_ambiguous and not self.fall_latched and self.fall_since is None:
++            desired = 'resting_in_chair'
++
+         # Never keep an old posture if the current pose cannot support it.
+         if desired in {'falling', 'lying_after_fall', 'prolonged_floor_lying', 'unknown'}:
+             self.state = self.pending_state = desired
+@@ -444,4 +515,5 @@
+         return Decision(self.state, posture, activity, events, ';'.join(reasons),
+                         f.quality, f.angle, f.knee, speed,
+                         motion if math.isfinite(motion) else None, amplitude, f.bed, f.floor,
+-                        floor_duration, self.floor_lying_latched)
++                        floor_duration, self.floor_lying_latched, f.chair, f.zone_ambiguous,
++                        self.fall_latched)
+--- /dev/null
++++ b/frame_health.py
+@@ -0,0 +1,51 @@
++"""Conservative frame-quality guard; not proof that a camera is operational.
++
++Exact duplicated decoded images and near-black frames are suspicious. A genuinely
++static scene can look frozen; a replay loop can evade this guard. No inference
++about the person's health is made. Use an independent service watchdog too.
++"""
++import hashlib
++import math
++import numpy as np
++
++
++class FrameHealth:
++    def __init__(self, dark_s=5., frozen_s=10., black_level=8.):
++        for x in (dark_s,frozen_s,black_level):
++            if isinstance(x,bool) or not math.isfinite(x) or x<=0:
++                raise ValueError('Frame health thresholds must be positive')
++        self.dark_s,self.frozen_s,self.black_level=dark_s,frozen_s,black_level
++        self.dark_since=self.same_since=self.last_t=None
++        self.digest=None
++        self.shape=None
++        self.calibration_invalid=False
++        self.state='starting'
++
++    def update(self,t,frame):
++        if not math.isfinite(t) or (self.last_t is not None and t<=self.last_t):
++            raise ValueError('Frame time must increase')
++        self.last_t=t
++        if not isinstance(frame,np.ndarray) or frame.size==0 or frame.ndim not in (2,3):
++            self.state='invalid_frame'
++            return self.state
++        if self.shape is not None and frame.shape != self.shape:
++            self.calibration_invalid=True
++        self.shape=frame.shape
++        # Hash complete image: sparse sampling could miss a small moving person.
++        digest=hashlib.blake2b(frame.tobytes(),digest_size=16).digest()
++        if digest != self.digest:
++            self.same_since=t
++            self.digest=digest
++        if float(np.mean(frame)) < self.black_level:
++            if self.dark_since is None: self.dark_since=t
++        else:
++            self.dark_since=None
++        if self.calibration_invalid:
++            self.state='frame_geometry_changed_recalibration_required'
++        elif self.dark_since is not None and t-self.dark_since>=self.dark_s:
++            self.state='image_too_dark'
++        elif self.same_since is not None and t-self.same_since>=self.frozen_s:
++            self.state='suspected_frozen_image'
++        else:
++            self.state='ok'
++        return self.state
+--- /dev/null
++++ b/incident_cli.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""Local operator interface. Restrict OS access; this is NOT a remote auth server."""
++import argparse
++import json
++from incidents import IncidentStore
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--db',required=True)
++    sub=p.add_subparsers(dest='command',required=True)
++    sub.add_parser('list')
++    sub.add_parser('delivery-status')
++    for command in ('ack','resolve'):
++        q=sub.add_parser(command)
++        q.add_argument('incident_id')
++        q.add_argument('--operator',required=True)
++        q.add_argument('--note',required=True,help='Non-sensitive reason/outcome; required audit entry')
++    args=p.parse_args()
++    store=IncidentStore(args.db)
++    try:
++        if args.command=='list':
++            print(json.dumps(store.active(),ensure_ascii=False,indent=2))
++        elif args.command=='delivery-status':
++            print(json.dumps(store.delivery_status(),indent=2))
++        else:
++            operation=store.acknowledge if args.command=='ack' else store.resolve
++            operation(args.incident_id,args.operator,args.note)
++            print('Recorded. Acknowledgement is not resolution; visual movement is not medical clearance.')
++    finally:
++        store.close()
++
++
++if __name__=='__main__': main()
+--- /dev/null
++++ b/incidents.py
+@@ -0,0 +1,193 @@
++"""Durable incident/outbox store. Single local installation, not a clinical system.
++
++SQLite transactions atomically persist incidents and notification intent. Delivery
++is at-least-once; consumers MUST deduplicate notification IDs. A transport receipt
++is never human acknowledgement. Neither pose recovery nor track expiry closes an
++incident. OS accounts/file ACLs are the authorization boundary for this local CLI.
++"""
++from contextlib import contextmanager
++import json
++import math
++import os
++from pathlib import Path
++import sqlite3
++import time
++import uuid
++
++PRIORITY={'review':1,'urgent':2}
++
++
++class IncidentStore:
++    def __init__(self,path,ack_timeout_s=60.,reminder_s=300.):
++        if any(isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<=0
++               for v in (ack_timeout_s,reminder_s)):
++            raise ValueError('Invalid incident deadline')
++        target=Path(path)
++        target.parent.mkdir(parents=True,exist_ok=True)
++        # Restrictive creation before sqlite opens the database. WAL inherits mode.
++        fd=os.open(str(target),os.O_CREAT|os.O_RDWR,0o600)
++        os.close(fd)
++        self.db=sqlite3.connect(str(target),timeout=10,isolation_level=None)
++        self.db.row_factory=sqlite3.Row
++        self.db.execute('PRAGMA foreign_keys=ON')
++        self.db.execute('PRAGMA journal_mode=WAL')
++        self.db.execute('PRAGMA synchronous=FULL')
++        self.ack_timeout_s,self.reminder_s=ack_timeout_s,reminder_s
++        self.db.executescript('''
++        CREATE TABLE IF NOT EXISTS incidents(
++          id TEXT PRIMARY KEY, scope TEXT NOT NULL, family TEXT NOT NULL,
++          priority TEXT NOT NULL, status TEXT NOT NULL,
++          opened REAL NOT NULL, updated REAL NOT NULL, next_action REAL NOT NULL,
++          reason TEXT NOT NULL, ack_timeout REAL NOT NULL, reminder REAL NOT NULL);
++        CREATE UNIQUE INDEX IF NOT EXISTS one_active ON incidents(scope,family) WHERE status!='resolved';
++        CREATE TABLE IF NOT EXISTS audit(
++          seq INTEGER PRIMARY KEY, incident_id TEXT, at REAL NOT NULL,
++          action TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL);
++        CREATE TABLE IF NOT EXISTS outbox(
++          id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES incidents(id),
++          payload TEXT NOT NULL, created REAL NOT NULL, due REAL NOT NULL,
++          attempts INTEGER NOT NULL DEFAULT 0, delivered REAL,
++          lease_until REAL NOT NULL DEFAULT 0, lease_token TEXT, last_error TEXT);
++        CREATE TABLE IF NOT EXISTS heartbeat(
++          site TEXT PRIMARY KEY, at REAL NOT NULL, state TEXT NOT NULL);
++        ''')
++
++    @contextmanager
++    def transaction(self):
++        self.db.execute('BEGIN IMMEDIATE')
++        try:
++            yield
++            self.db.execute('COMMIT')
++        except BaseException:
++            self.db.execute('ROLLBACK')
++            raise
++
++    @staticmethod
++    def _time(now):
++        value=time.time() if now is None else now
++        if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
++            raise ValueError('Invalid wall clock')
++        return value
++
++    def _audit(self,ident,now,action,actor,detail):
++        self.db.execute('INSERT INTO audit(incident_id,at,action,actor,detail) VALUES(?,?,?,?,?)',
++                        (ident,now,action,actor,detail))
++
++    def _notify(self,row,now,action):
++        mid=uuid.uuid4().hex
++        payload=json.dumps({'schema_version':1,'notification_id':mid,'incident_id':row['id'],
++                            'scope':row['scope'],'family':row['family'],'priority':row['priority'],
++                            'status':row['status'],'reason':row['reason'],'action':action,
++                            'created_at_epoch':now,'notice':'Review request, not medical diagnosis.'},allow_nan=False)
++        self.db.execute('INSERT INTO outbox(id,incident_id,payload,created,due) VALUES(?,?,?,?,?)',
++                        (mid,row['id'],payload,now,now))
++
++    def get(self,ident):
++        row=self.db.execute('SELECT * FROM incidents WHERE id=?',(ident,)).fetchone()
++        if row is None: raise ValueError('Incident not found')
++        return dict(row)
++
++    def open(self,scope,family,priority,reason,now=None,*,new_evidence=False):
++        now=self._time(now)
++        if priority not in PRIORITY or not all(isinstance(v,str) and v.strip() for v in (scope,family,reason)):
++            raise ValueError('Invalid incident')
++        with self.transaction():
++            row=self.db.execute("SELECT * FROM incidents WHERE scope=? AND family=? AND status!='resolved'",(scope,family)).fetchone()
++            if row:
++                ident=row['id']
++                # No notification storm from repeat observations. Stronger evidence
++                # reopens ACK and immediately alerts even within an existing incident.
++                if PRIORITY[priority]>PRIORITY[row['priority']] or new_evidence:
++                    priority = max((priority,row['priority']),key=PRIORITY.get)
++                    self.db.execute("UPDATE incidents SET priority=?,status='open',updated=?,next_action=?,reason=? WHERE id=?",
++                                    (priority,now,now+row['ack_timeout'],reason,ident))
++                    self._audit(ident,now,'evidence_upgraded','engine',reason)
++                    self._notify(self.get(ident),now,'evidence_upgraded')
++                return ident
++            ident=uuid.uuid4().hex
++            self.db.execute('INSERT INTO incidents VALUES(?,?,?,?,?,?,?,?,?,?,?)',
++                            (ident,scope,family,priority,'open',now,now,now+self.ack_timeout_s,reason,self.ack_timeout_s,self.reminder_s))
++            self._audit(ident,now,'opened','engine',reason)
++            self._notify(self.get(ident),now,'opened')
++            return ident
++
++    def acknowledge(self,ident,actor,note,now=None):
++        self._human_action(ident,actor,note,'acknowledged',now)
++
++    def resolve(self,ident,actor,note,now=None):
++        self._human_action(ident,actor,note,'resolved',now)
++
++    def _human_action(self,ident,actor,note,status,now):
++        now=self._time(now)
++        if not isinstance(actor,str) or not actor.strip() or not isinstance(note,str) or not note.strip():
++            raise ValueError('Named operator and reason are required')
++        if len(actor)>128 or len(note)>2000:
++            raise ValueError('Operator/note too long; do not enter unnecessary health data')
++        with self.transaction():
++            row=self.get(ident)
++            if row['status']=='resolved': raise ValueError('Incident already resolved')
++            self.db.execute('UPDATE incidents SET status=?,updated=?,next_action=? WHERE id=?',
++                            (status,now,now+row['reminder'],ident))
++            self._audit(ident,now,status,actor,note)
++            self._notify(self.get(ident),now,status)
++
++    def tick(self,now=None):
++        """Call from independent dispatcher even while vision is unavailable."""
++        now=self._time(now)
++        with self.transaction():
++            rows=self.db.execute("SELECT * FROM incidents WHERE status!='resolved' AND next_action<=?",(now,)).fetchall()
++            for row in rows:
++                action='acknowledgement_overdue' if row['status']=='open' else 'resolution_review_overdue'
++                # Operational urgency, NOT newly inferred clinical deterioration.
++                self.db.execute("UPDATE incidents SET priority='urgent',updated=?,next_action=? WHERE id=?",
++                                (now,now+row['reminder'],row['id']))
++                self._audit(row['id'],now,action,'scheduler','human_response_deadline;not_clinical_evidence')
++                self._notify(self.get(row['id']),now,action)
++
++    def heartbeat(self,site,state,now=None):
++        now=self._time(now)
++        self.db.execute('INSERT INTO heartbeat VALUES(?,?,?) ON CONFLICT(site) DO UPDATE SET at=excluded.at,state=excluded.state',
++                        (site,now,state))
++
++    def check_heartbeat(self,site,stale_s=30.,now=None):
++        now=self._time(now)
++        if not math.isfinite(stale_s) or stale_s<=0: raise ValueError('Invalid heartbeat threshold')
++        row=self.db.execute('SELECT * FROM heartbeat WHERE site=?',(site,)).fetchone()
++        if row is None or now-row['at']>stale_s or row['state']=='stopped':
++            return self.open(f'site:{site}','service_health','urgent','vision_heartbeat_missing_or_stopped;monitoring_unavailable',now)
++        return None
++
++    def claim(self,now=None,lease_s=30.):
++        now=self._time(now)
++        if not math.isfinite(lease_s) or lease_s<=0: raise ValueError('Invalid lease')
++        with self.transaction():
++            # Preserve creation order per incident; no stale opening after a close.
++            row=self.db.execute('''SELECT o.* FROM outbox o WHERE delivered IS NULL AND due<=? AND lease_until<=?
++             AND NOT EXISTS(SELECT 1 FROM outbox p WHERE p.incident_id=o.incident_id AND p.delivered IS NULL AND p.rowid<o.rowid)
++             ORDER BY o.rowid LIMIT 1''',(now,now)).fetchone()
++            if row is None: return None
++            token=uuid.uuid4().hex
++            self.db.execute('UPDATE outbox SET lease_until=?,lease_token=? WHERE id=?',(now+lease_s,token,row['id']))
++            return {**dict(row),'lease_token':token}
++
++    def delivery_result(self,ident,token,success,error='',now=None):
++        now=self._time(now)
++        with self.transaction():
++            row=self.db.execute('SELECT * FROM outbox WHERE id=? AND lease_token=? AND delivered IS NULL',(ident,token)).fetchone()
++            if row is None: return False
++            if success:
++                self.db.execute('UPDATE outbox SET delivered=?,attempts=attempts+1,lease_until=0,lease_token=NULL,last_error=NULL WHERE id=?',(now,ident))
++            else:
++                delay=min(300.,2.**min(row['attempts']+1,8))
++                self.db.execute('UPDATE outbox SET attempts=attempts+1,due=?,lease_until=0,lease_token=NULL,last_error=? WHERE id=?',
++                                (now+delay,error[:80],ident))
++            return True
++
++    def active(self):
++        return [dict(r) for r in self.db.execute("SELECT * FROM incidents WHERE status!='resolved' ORDER BY opened")]
++
++    def delivery_status(self):
++        return dict(self.db.execute('SELECT COUNT(*) AS pending,COALESCE(MAX(attempts),0) AS max_attempts FROM outbox WHERE delivered IS NULL').fetchone())
++
++    def close(self):
++        self.db.close()
+--- a/monitor.py
++++ b/monitor.py
+@@ -8,6 +8,8 @@
+ from datetime import datetime, timezone
+ import json
+ import math
++import os
++import hashlib
+ from pathlib import Path
+ import queue
+ import sys
+@@ -16,6 +18,9 @@
+ import uuid
+ 
+ from engine import Config, Decision, TemporalMonitor, extract_feature
++from care_policy import CareConfig, CarePolicy
++from incidents import IncidentStore
++from frame_health import FrameHealth
+ 
+ 
+ CSV_FIELDS = [
+@@ -29,7 +34,10 @@
+ 
+ 
+ class CSVLogger:
+-    def __init__(self, path: str, run_id: str, time_basis: str):
++    def __init__(self, path: str, run_id: str, time_basis: str, max_bytes=20*1024*1024, backups=5):
++        if type(max_bytes) is not int or max_bytes<1024 or type(backups) is not int or backups<1:
++            raise ValueError('CSV rotation requires >=1024 bytes and >=1 backup')
++        self.max_bytes, self.backups = max_bytes, backups
+         self.path = Path(path)
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+         exists = self.path.exists() and self.path.stat().st_size > 0
+@@ -37,6 +45,8 @@
+             with self.path.open(encoding='utf-8-sig', newline='') as f:
+                 if next(csv.reader(f), None) != CSV_FIELDS:
+                     raise ValueError('Existing CSV has a different schema. Choose another --csv path.')
++        fd = os.open(str(self.path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
++        os.close(fd)
+         # BOM makes new files readable in Excel; append uses plain UTF-8.
+         self.file = self.path.open('a', encoding='utf-8' if exists else 'utf-8-sig', newline='')
+         self.writer = csv.DictWriter(self.file, fieldnames=CSV_FIELDS)
+@@ -45,8 +55,26 @@
+             self.writer.writeheader()
+             self.file.flush()
+ 
++    def _rotate(self):
++        self.file.close()
++        oldest = self.path.with_name(self.path.name+f'.{self.backups}')
++        oldest.unlink(missing_ok=True)
++        for i in range(self.backups-1,0,-1):
++            source = self.path.with_name(self.path.name+f'.{i}')
++            if source.exists():
++                source.replace(self.path.with_name(self.path.name+f'.{i+1}'))
++        self.path.replace(self.path.with_name(self.path.name+'.1'))
++        fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
++        os.close(fd)
++        self.file = self.path.open('a',encoding='utf-8-sig',newline='')
++        self.writer = csv.DictWriter(self.file,fieldnames=CSV_FIELDS)
++        self.writer.writeheader()
++        self.file.flush()
++
+     def write(self, t: float, frame: int, track: int | str, row_type: str,
+               d: Decision, event: str = '', box=None, detection_conf=None, fps=None):
++        if self.file.tell() >= self.max_bytes:
++            self._rotate()
+         row = dict.fromkeys(CSV_FIELDS, '')
+         row.update(run_id=self.run_id, logged_at_utc=datetime.now(timezone.utc).isoformat(),
+                    source_seconds=round(t, 4), time_basis=self.time_basis,
+@@ -133,6 +161,7 @@
+ class Track:
+     monitor: TemporalMonitor
+     last_seen: float
++    policy: CarePolicy | None = None
+     last_log: float = -1e30
+     last_key: tuple = ()
+     lost: bool = False
+@@ -154,15 +183,38 @@
+     p.add_argument('--video-fps', type=float, default=None, help='Fallback FPS if video metadata is invalid')
+     p.add_argument('--stream-timeout', type=float, default=10.0)
+     p.add_argument('--print-config', action='store_true', help='Print effective config and exit, without loading YOLO')
++    p.add_argument('--max-csv-bytes', type=int, default=20*1024*1024)
++    p.add_argument('--csv-backups', type=int, default=5)
++    p.add_argument('--care-config', help='Approved per-site care policy; inactivity disabled by default')
++    p.add_argument('--incident-db', help='Durable SQLite store; default is CSV stem + .incidents.sqlite3')
++    p.add_argument('--site-id', default='local-site', help='Non-sensitive installation label, not resident identity')
++    p.add_argument('--source-env', help='Read camera URL from this environment variable rather than argv')
++    p.add_argument('--require-local-model', action='store_true', help='Reject absent model file; avoid automatic download')
++    p.add_argument('--check-frame-health', action='store_true', help='Also run frame health checks on offline files')
++    p.add_argument('--max-frame-age', type=float, default=1.0, help='Maximum local decoded frame age including inference, live only')
+     return p
+ 
+ 
+ def run(args) -> int:
+     from dataclasses import asdict
+     cfg = Config.load(args.config)
++    care = CareConfig.load(args.care_config)
++    care.max_gap_s = min(care.max_gap_s, cfg.max_gap_s)
++    if args.source_env:
++        args.source = os.environ.get(args.source_env, '')
++        if not args.source:
++            raise ValueError('Source environment variable is unset or empty')
++    if not args.site_id or len(args.site_id)>80 or not all(c.isalnum() or c in '-_' for c in args.site_id):
++        raise ValueError('site-id must be a short alphanumeric installation label')
+     if args.print_config:
+         print(json.dumps(asdict(cfg), ensure_ascii=False, indent=2))
+         return 0
++    if any(not math.isfinite(v) for v in (args.conf,args.stream_timeout,args.max_seconds,args.max_frame_age)) or args.max_frame_age <= 0:
++        raise ValueError('Non-finite or invalid runtime argument')
++    if args.video_fps is not None and not math.isfinite(args.video_fps):
++        raise ValueError('Invalid FPS')
++    if args.require_local_model and not Path(args.model).is_file():
++        raise ValueError('A trusted local model file is required')
+     if args.imgsz < 128 or not 0 < args.conf < 1 or args.stream_timeout <= 0:
+         raise ValueError('Invalid --imgsz, --conf or --stream-timeout')
+     if args.max_seconds < 0 or (args.video_fps is not None and args.video_fps <= 0):
+@@ -180,7 +232,7 @@
+         raise ValueError('Video file does not exist. Use ./0 for a file literally named 0.')
+     print('EXPERIMENTAL: posture/motion heuristics; no medical diagnosis or accuracy guarantee.')
+     if not cfg.bed_polygon:
+-        print('possible_sleep DISABLED: no bed_polygon configured.')
++        print('resting_in_bed DISABLED: no bed_polygon configured.')
+     if not cfg.floor_polygon:
+         print('WARNING: floor region is not configured; fall location is ambiguous.')
+         print('prolonged_floor_lying DISABLED: configure floor_polygon first.')
+@@ -193,15 +245,31 @@
+                   imgsz=args.imgsz, device=args.device, verbose=False)
+ 
+     run_id = uuid.uuid4().hex[:12]
+-    logger = CSVLogger(args.csv, run_id, 'live_decode_monotonic' if live else 'video_relative')
++    logger = CSVLogger(args.csv, run_id, 'live_decode_monotonic' if live else 'video_relative', args.max_csv_bytes, args.csv_backups)
++    store = IncidentStore(args.incident_db or str(Path(args.csv).with_suffix('.incidents.sqlite3')),
++                          care.ack_timeout_s, care.resolution_reminder_s)
++    # Replay runs are deliberately separated from live service identity.
++    site = args.site_id if live else f'replay-{run_id}'
++    guard = FrameHealth() if live or args.check_frame_health else None
++    last_health = 'starting'
++    print('LOCAL INCIDENTS ENABLED. Remote delivery requires a separate configured delivery.py worker.')
++    def apply_policy(tid, tr, decision, absent=False):
++        for signal in tr.policy.update(t, decision, absent=absent):
++            ident = store.open(f'{site}:{run_id}:track-{tid}', signal.family, signal.priority, signal.reason, new_evidence=(signal.family == 'safety'))
++            logger.write(t, frame_index, tid, 'event', Decision(reason=signal.reason), f'care_{signal.family}_{signal.priority}')
++            print(f'CARE REVIEW | incident={ident} priority={signal.priority} family={signal.family}', flush=True)
++
+     # Save thresholds/model/settings for reproducibility, but never persist RTSP credentials.
+     metadata = {'run_id': run_id, 'created_utc': datetime.now(timezone.utc).isoformat(),
+                 'model': Path(args.model).name, 'device': args.device, 'imgsz': args.imgsz,
+                 'det_conf': args.conf, 'source_type': 'remote' if remote else 'camera' if webcam else 'file',
+-                'config': asdict(cfg), 'validated_accuracy': None,
++                'config': asdict(cfg), 'care_policy': asdict(care), 'schema_version': 2, 'validated_accuracy': None,
+                 'notice': 'Experimental heuristics; pose_quality is NOT event confidence.'}
+     import ultralytics
+     metadata.update(ultralytics_version=ultralytics.__version__, opencv_version=cv2.__version__)
++    if Path(args.model).is_file():
++        with open(args.model,'rb') as model_file:
++            metadata['model_sha256'] = hashlib.file_digest(model_file,'sha256').hexdigest() if hasattr(hashlib,'file_digest') else None
+     metadata_path = Path(args.csv).with_name(f'run_{run_id}.json')
+     capture = reader = None
+     tracks: dict[int, Track] = {}
+@@ -223,10 +291,12 @@
+         if not live and (not math.isfinite(video_fps) or video_fps <= 0):
+             raise ValueError('Video FPS unavailable; supply --video-fps 25 or actual recording FPS.')
+         logger.system(t, frame_index, 'monitor_started', 'local_processing;no_video_saved')
++        store.heartbeat(site, 'running')
+         last_source_t = None
+         last_arrival = time.monotonic()
+         last_no_person = -1e30
+         had_person = False
++        no_person_since = None
+         last_gap_warning = -1e30
+         fps_ema = 0.0
+         while True:
+@@ -235,6 +305,7 @@
+                 if packet is None:
+                     if reader.ended.is_set() or time.monotonic() - last_arrival > args.stream_timeout:
+                         logger.system(t, frame_index, 'camera_unavailable', 'monitoring_interrupted;restart_required')
++                        store.open(f'site:{site}', 'service_health', 'urgent', 'camera_unavailable;monitoring_interrupted')
+                         print('CAMERA UNAVAILABLE: monitoring interrupted.', file=sys.stderr)
+                         status = 2
+                         break
+@@ -265,17 +336,32 @@
+                 logger.system(t, frame_index, 'temporal_sampling_gap', 'rapid_events_may_be_missed;use_faster_model_or_GPU')
+                 last_gap_warning = t
+             last_source_t = t
++            health = guard.update(t, frame) if guard else 'ok'
++            if live and time.monotonic()-reader.origin-t > args.max_frame_age:
++                health = 'stale_decoded_frame'
+             start = time.perf_counter()
+-            result = model.track(frame, persist=True, tracker='bytetrack.yaml',
+-                                 conf=args.conf, iou=0.5, imgsz=args.imgsz, device=args.device,
+-                                 verbose=False, classes=[0])[0]
++            result = None
++            if health == 'ok':
++                result = model.track(frame, persist=True, tracker='bytetrack.yaml',
++                                     conf=args.conf, iou=0.5, imgsz=args.imgsz, device=args.device,
++                                     verbose=False, classes=[0])[0]
++                if live and time.monotonic()-reader.origin-t > args.max_frame_age:
++                    health = 'inference_result_too_old'
++                    result = None
++            if health != last_health:
++                logger.system(t, frame_index, 'frame_health_changed', health)
++                if health != 'ok':
++                    store.open(f'site:{site}', 'frame_health', 'urgent', health+';not_monitoring_reliably')
++                last_health = health
++            store.heartbeat(site, health)
++            store.tick()
+             elapsed = time.perf_counter() - start
+             fps = 1 / max(elapsed, 1e-6)
+             fps_ema = fps if fps_ema == 0 else 0.9 * fps_ema + 0.1 * fps
+             height, width = frame.shape[:2]
+             seen = set()
+             overlay = []
+-            if result.boxes is not None and len(result.boxes) and result.boxes.id is not None and result.keypoints is not None:
++            if result is not None and result.boxes is not None and len(result.boxes) and result.boxes.id is not None and result.keypoints is not None:
+                 boxes = result.boxes.xyxy.cpu().numpy()
+                 ids = result.boxes.id.int().cpu().tolist()
+                 det_conf = result.boxes.conf.cpu().numpy()
+@@ -285,12 +371,13 @@
+                 for box, tid, keypoint, confidence in zip(boxes, ids, keypoints, det_conf):
+                     seen.add(tid)
+                     if tid not in tracks:
+-                        tracks[tid] = Track(TemporalMonitor(cfg), t)
++                        tracks[tid] = Track(TemporalMonitor(cfg), t, policy=CarePolicy(care))
+                     tr = tracks[tid]
+                     tr.last_seen, tr.box, tr.detection_conf = t, box, float(confidence)
+                     tr.lost = False
+                     feat = extract_feature(t, keypoint, box, (width, height), cfg)
+                     d = tr.monitor.update(feat) if feat is not None else tr.monitor.missing(t)
++                    apply_policy(tid, tr, d)
+                     key = (d.state, d.posture, d.activity)
+                     common = dict(box=box, detection_conf=float(confidence), fps=fps_ema)
+                     if key != tr.last_key:
+@@ -301,34 +388,46 @@
+                         tr.last_log = t
+                     for event in d.events:
+                         logger.write(t, frame_index, tid, 'event', d, event, **common)
+-                        if event in {'possible_fall', 'possible_collapse', 'prolonged_floor_lying'}:
++                        if event in {'possible_fall', 'prolonged_floor_lying'}:
+                             print(f'REVIEW NOW | t={t:.2f}s track={tid} event={event}', flush=True)
+                     overlay.append((box, tid, d.state))
+             for tid, tr in list(tracks.items()):
+                 if tid not in seen:
++                    d = tr.monitor.missing(t, 'person_not_tracked;monitoring_gap')
++                    apply_policy(tid, tr, d, absent=(health == 'ok'))
+                     if not tr.lost:
+-                        d = tr.monitor.missing(t, 'person_not_tracked;monitoring_gap')
+                         logger.write(t, frame_index, tid, 'event', d, 'tracking_lost', box=tr.box)
+                         tr.lost, tr.last_key, tr.last_log = True, ('unknown', 'unknown', 'unknown'), t
+-                    if t - tr.last_seen > cfg.track_ttl_s:
++                    if t - tr.last_seen > (max(cfg.track_ttl_s, care.coverage_checkin_s + 1) if care.expected_presence else cfg.track_ttl_s):
+                         if tr.monitor.floor_lying_latched:
+                             logger.write(t, frame_index, tid, 'event',
+                                          Decision(reason='floor_lying_alert_unresolved;identity_lost;manual_review_required',
+                                                   floor_lying_alert_active=True),
+                                          'floor_lying_tracking_expired', box=tr.box)
++                        if tr.monitor.fall_latched:
++                            logger.write(t, frame_index, tid, 'event', Decision(reason='fall_unresolved;manual_review_required'),
++                                         'fall_tracking_expired', box=tr.box)
+                         del tracks[tid]
+             if not seen and (had_person or t - last_no_person >= cfg.log_interval_s):
+                 logger.system(t, frame_index, 'no_person_tracked', 'empty_scene_or_detection_failure_not_evidence_of_safety')
+                 last_no_person = t
++            if seen:
++                no_person_since = None
++            elif care.expected_presence:
++                if no_person_since is None:
++                    no_person_since = t
++                if t-no_person_since >= care.coverage_checkin_s:
++                    store.open(f'site:{site}', 'expected_presence', 'review',
++                               'expected_presence_not_observed;absence_or_detection_failure_not_medical_diagnosis')
+             had_person = bool(seen)
+             if args.show:
+-                canvas = result.plot()
++                canvas = result.plot() if result is not None else frame.copy()
+                 for box, tid, state in overlay:
+                     color = (0, 0, 255) if state in {'falling', 'lying_after_fall', 'prolonged_floor_lying'} else (0, 220, 220)
+                     cv2.putText(canvas, f'ID {tid}: {state}',
+                                 (max(0, int(box[0])), max(25, int(box[1]) - 12)),
+                                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+-                for poly, color in [(cfg.bed_polygon, (255, 180, 0)), (cfg.floor_polygon, (80, 180, 80))]:
++                for poly, color in [(cfg.bed_polygon, (255, 180, 0)), (cfg.floor_polygon, (80, 180, 80)), (cfg.chair_polygon, (180, 80, 180))]:
+                     if poly:
+                         pts = (np.array(poly) * [width, height]).astype(np.int32)
+                         cv2.polylines(canvas, [pts], True, color, 2)
+@@ -343,6 +442,7 @@
+         # Avoid writing exception strings which might contain network credentials.
+         logger.system(t, frame_index, 'runtime_error', type(exc).__name__)
+         print(f'ERROR: {type(exc).__name__}. Monitoring stopped. Check setup/camera/model.', file=sys.stderr)
++        store.open(f'site:{site}', 'service_health', 'urgent', 'vision_runtime_error;'+type(exc).__name__)
+         status = 2
+     finally:
+         if reader is not None:
+@@ -358,6 +458,10 @@
+                                       floor_lying_alert_active=True),
+                              'floor_lying_monitor_stopped', box=tr.box)
+         logger.system(t, frame_index, 'monitor_stopped', 'not_monitoring_after_this_row')
++        store.heartbeat(site, 'stopped')
++        if live:
++            store.open(f'site:{site}', 'service_health', 'urgent', 'vision_stopped;not_monitoring')
++        store.close()
+         logger.close()
+     print(f'CSV: {args.csv}')
+     return status
+--- a/select_zones.py
++++ b/select_zones.py
+@@ -34,16 +34,16 @@
+     ratio = min(1, 1280/w, 800/h)
+     base = cv2.resize(frame, (round(w*ratio), round(h*ratio)))
+     dh, dw = base.shape[:2]
+-    polys = {'bed': list(cfg.bed_polygon), 'floor': list(cfg.floor_polygon)}
++    polys = {'bed': list(cfg.bed_polygon), 'floor': list(cfg.floor_polygon), 'chair': list(cfg.chair_polygon)}
+     active = ['bed']
+-    name = 'Zones: B bed | F floor | U undo | C clear | S save | Q quit'
++    name = 'Zones: B bed | F floor | R recliner | U undo | C clear | S save | Q quit'
+ 
+     def click(event, x, y, flags, param):
+         if event == cv2.EVENT_LBUTTONDOWN:
+             polys[active[0]].append([round(x/dw, 6), round(y/dh, 6)])
+     cv2.namedWindow(name)
+     cv2.setMouseCallback(name, click)
+-    print('Click boundary vertices in order. B/F selects region; U undo; C clears selected region.')
++    print('Click boundary vertices in order. B/F/R selects region; U undo; C clears selected region.')
+     print('Define bed surface and visible floor separately. Do not overlap them. S saves, Q cancels.')
+     try:
+         while True:
+@@ -55,7 +55,7 @@
+                     cv2.polylines(canvas, [a], len(pts) >= 3, color, 2)
+                     for point in a:
+                         cv2.circle(canvas, tuple(point), 4, color, -1)
+-            cv2.putText(canvas, f'Editing: {active[0]} | B/F switch, U undo, C clear, S save',
++            cv2.putText(canvas, f'Editing: {active[0]} | B/F/R switch, U undo, C clear, S save',
+                         (8, 25), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2)
+             cv2.imshow(name, canvas)
+             key = cv2.waitKey(30) & 0xFF
+@@ -64,6 +64,8 @@
+                 return
+             if key == ord('b'):
+                 active[0] = 'bed'
++            elif key == ord('r'):
++                active[0] = 'chair'
+             elif key == ord('f'):
+                 active[0] = 'floor'
+             elif key == ord('c'):
+@@ -71,14 +73,16 @@
+             elif key == ord('u') and polys[active[0]]:
+                 polys[active[0]].pop()
+             elif key == ord('s'):
+-                cfg.bed_polygon, cfg.floor_polygon = polys['bed'], polys['floor']
++                cfg.bed_polygon, cfg.floor_polygon, cfg.chair_polygon = polys['bed'], polys['floor'], polys['chair']
+                 try:
+                     cfg.validate()
+                 except ValueError as exc:
+                     print(exc)
+                     continue
+                 path.parent.mkdir(parents=True, exist_ok=True)
+-                path.write_text(json.dumps(asdict(cfg), indent=2), encoding='utf-8')
++                temporary = path.with_suffix(path.suffix+'.tmp')
++                temporary.write_text(json.dumps(asdict(cfg), indent=2), encoding='utf-8')
++                temporary.replace(path)
+                 print(f'Saved {path}. Recalibrate after moving or cropping the camera.')
+                 return
+     finally:
+--- /dev/null
++++ b/tests/test_care_policy.py
+@@ -0,0 +1,143 @@
++"""Synthetic policy tests: not evidence of sleep/fall recognition accuracy."""
++from dataclasses import replace
++import math
++import unittest
++
++from care_policy import CareConfig,CarePolicy
++from engine import Decision
++
++
++def resting(**kw):
++    return replace(Decision(posture='lying',state='resting_in_bed',in_bed=True,
++                            pose_quality=.95,motion_speed=0.,activity='still'),**kw)
++
++
++class CarePolicyTests(unittest.TestCase):
++    def cfg(self,**kw):
++        return replace(CareConfig(inactivity_enabled=True,care_plan_id='TEST_ONLY',nonrest_checkin_s=2.),**kw)
++
++    def test_two_hours_still_in_bed_no_inactivity_alarm(self):
++        p=CarePolicy(self.cfg())
++        signals=[]
++        for i in range(14401):
++            signals+=p.update(i*.5,resting())
++        self.assertEqual(signals,[])
++        self.assertEqual(p.still_observed_s,7200.)
++
++    def test_two_hours_in_recliner_no_inactivity_alarm(self):
++        p=CarePolicy(self.cfg())
++        for i in range(14401):
++            self.assertEqual(p.update(i*.5,resting(in_bed=False,in_chair=True,posture='sitting')),[])
++
++    def test_inactivity_disabled_by_default(self):
++        p=CarePolicy(CareConfig())
++        for i in range(100):
++            self.assertEqual(p.update(i*.5,resting(in_bed=False)),[])
++
++    def test_nonrest_checkin_is_review_not_emergency(self):
++        p=CarePolicy(self.cfg())
++        signals=[]
++        for i in range(20): signals+=p.update(i*.5,resting(in_bed=False))
++        self.assertEqual([(s.family,s.priority) for s in signals],[('inactivity','review')])
++
++    def test_approved_optional_rest_checkin(self):
++        p=CarePolicy(self.cfg(rest_checkin_s=3.))
++        signals=[]
++        for i in range(9): signals+=p.update(i*.5,resting())
++        self.assertEqual(len(signals),1)
++        self.assertEqual(signals[0].priority,'review')
++        self.assertIn('not_unconsciousness',signals[0].reason)
++
++    def test_fall_overrides_rest_in_same_frame(self):
++        p=CarePolicy(self.cfg())
++        signals=p.update(0,resting(events=['possible_fall']))
++        self.assertEqual([(s.family,s.priority) for s in signals],[('safety','urgent')])
++
++    def test_floor_event_not_suppressed_by_motion(self):
++        p=CarePolicy(self.cfg())
++        signals=p.update(0,resting(in_bed=False,motion_speed=1.,events=['prolonged_floor_lying']))
++        self.assertEqual(signals[0].priority,'urgent')
++
++    def test_high_speed_alone_is_not_diagnosis_or_emergency(self):
++        p=CarePolicy(self.cfg())
++        self.assertEqual(p.update(0,resting(events=['rapid_descent','rapid_descent_high_speed'])),[])
++
++    def test_unconfirmed_descent_on_bed_gets_review(self):
++        p=CarePolicy(self.cfg())
++        signals=p.update(0,resting(events=['descent_unconfirmed']))
++        self.assertEqual(signals[0].family,'safety')
++        self.assertEqual(signals[0].priority,'review')
++
++    def test_occlusion_during_descent_not_silently_discarded(self):
++        p=CarePolicy(self.cfg())
++        p.update(0,resting(events=['rapid_descent']))
++        signals=p.update(.5,Decision(),absent=True)
++        self.assertEqual(signals[0].family,'safety')
++        self.assertEqual(p.update(1.,Decision(),absent=True),[])
++
++    def test_missing_frames_do_not_accumulate_inactivity(self):
++        p=CarePolicy(self.cfg())
++        p.update(0,resting(in_bed=False));p.update(.5,resting(in_bed=False))
++        p.update(1,Decision())
++        for t in (1.5,2.,2.5):
++            self.assertFalse(p.update(t,resting(in_bed=False)))
++        self.assertEqual(p.still_observed_s,1.)
++
++    def test_time_jump_does_not_count_as_stillness(self):
++        p=CarePolicy(self.cfg())
++        p.update(0,resting(in_bed=False))
++        self.assertEqual(p.update(100,resting(in_bed=False)),[])
++        self.assertEqual(p.still_observed_s,0.)
++
++    def test_low_quality_triggers_coverage_not_inactivity(self):
++        p=CarePolicy(self.cfg(coverage_checkin_s=1.))
++        signals=[]
++        for i in range(10): signals+=p.update(i*.5,resting(pose_quality=.2))
++        self.assertEqual([s.family for s in signals],['coverage'])
++
++    def test_empty_room_not_abnormal_without_care_plan(self):
++        p=CarePolicy(CareConfig(coverage_checkin_s=1.))
++        for i in range(10): self.assertEqual(p.update(i*.5,Decision(),absent=True),[])
++
++    def test_expected_presence_absence_review(self):
++        p=CarePolicy(self.cfg(expected_presence=True,coverage_checkin_s=1.))
++        signals=[]
++        for i in range(10): signals+=p.update(i*.5,Decision(),absent=True)
++        self.assertEqual([s.family for s in signals],['coverage'])
++
++    def test_overlap_cannot_hide_inactivity_as_rest(self):
++        p=CarePolicy(self.cfg(coverage_checkin_s=1.))
++        signals=[]
++        for i in range(10): signals+=p.update(i*.5,resting(zone_ambiguous=True))
++        self.assertEqual([s.family for s in signals],['calibration'])
++        self.assertEqual(p.still_observed_s,0.)
++
++    def test_context_change_resets_pending_timer(self):
++        p=CarePolicy(self.cfg())
++        for i in range(4): p.update(i*.5,resting())
++        self.assertEqual(p.update(2.,resting(in_bed=False)),[])
++        self.assertEqual(p.still_observed_s,0.)
++
++    def test_motion_breaks_pending_but_does_not_instantly_rearm(self):
++        p=CarePolicy(self.cfg())
++        for i in range(5):p.update(i*.5,resting(in_bed=False))
++        self.assertTrue(p.sent_inactivity)
++        p.update(2.5,resting(in_bed=False,motion_speed=1.))
++        self.assertEqual(p.still_observed_s,0.)
++        self.assertTrue(p.sent_inactivity)
++        for t in (3.,3.5,4.,4.5):p.update(t,resting(in_bed=False,motion_speed=1.))
++        self.assertFalse(p.sent_inactivity)
++
++    def test_invalid_configs(self):
++        for key,value in [('nonrest_checkin_s',True),('rest_checkin_s',float('nan')),
++                          ('min_pose_quality',2),('inactivity_enabled',1),('care_plan_id',None)]:
++            with self.subTest(key=key),self.assertRaises(ValueError):
++                replace(CareConfig(),**{key:value}).validate()
++        with self.assertRaises(ValueError): CareConfig(inactivity_enabled=True).validate()
++        with self.assertRaises(ValueError): self.cfg(rest_checkin_s=1.).validate()
++
++    def test_policy_timestamps_must_increase(self):
++        p=CarePolicy(self.cfg())
++        p.update(1,resting())
++        for t in (1,0,float('nan'),float('inf')):
++            with self.assertRaises(ValueError):p.update(t,resting())
+--- a/tests/test_engine.py
++++ b/tests/test_engine.py
+@@ -55,7 +55,7 @@
+     def test_walking(self):
+         _, ds = simulate(lambda t, c: pose(t, x=400 + 50*t, cfg=c)[0])
+         self.assertEqual(ds[-1].state, 'walking')
+-        self.assertFalse(any(d.state == 'unsteady_gait' for d in ds))
++        self.assertFalse(any(d.state == 'possible_postural_sway' for d in ds))
+ 
+     def test_lying_not_fall(self):
+         _, ds = simulate(lambda t, c: pose(t, y=600, angle=90, cfg=c)[0])
+@@ -70,21 +70,21 @@
+     def test_sleep_proxy_with_bed(self):
+         cfg = Config(sleep_still_s=.8, bed_polygon=[[.1, .4], [.8, .4], [.8, .8], [.1, .8]])
+         _, ds = simulate(lambda t, c: pose(t, y=600, angle=90, cfg=c)[0], cfg=cfg)
+-        self.assertEqual(ds[-1].state, 'possible_sleep')
++        self.assertEqual(ds[-1].state, 'resting_in_bed')
+ 
+     def test_moving_on_bed_is_not_sleep(self):
+         cfg = Config(sleep_still_s=.8, bed_polygon=[[0, .4], [1, .4], [1, .9], [0, .9]])
+         _, ds = simulate(lambda t, c: pose(t, x=350+60*t, y=600, angle=90, cfg=c)[0], cfg=cfg)
+-        self.assertNotEqual(ds[-1].state, 'possible_sleep')
++        self.assertNotEqual(ds[-1].state, 'resting_in_bed')
+ 
+     def test_rapid_fall_detected_once(self):
+         def falling(t, cfg):
+             progress = min(1, max(0, (t - 1) / .5))
+             return pose(t, y=320 + 280*progress, angle=90*progress, cfg=cfg)[0]
+-        _, ds = simulate(falling, duration=5)
++        _, ds = simulate(falling, duration=5, cfg=Config(floor_polygon=[[0,.4],[1,.4],[1,.95],[0,.95]]))
+         events = [e for d in ds for e in d.events]
+         self.assertEqual(events.count('possible_fall'), 1)
+-        self.assertEqual(events.count('possible_collapse'), 1)
++        self.assertEqual(events.count('rapid_descent_high_speed'), 1)
+         self.assertEqual(ds[-1].state, 'lying_after_fall')
+ 
+     def test_fall_at_different_frame_rates(self):
+@@ -92,7 +92,7 @@
+             def falling(t, cfg):
+                 p = min(1, max(0, (t - 1) / .5))
+                 return pose(t, y=320+280*p, angle=90*p, cfg=cfg)[0]
+-            _, ds = simulate(falling, fps=fps)
++            _, ds = simulate(falling, fps=fps, cfg=Config(floor_polygon=[[0,.4],[1,.4],[1,.95],[0,.95]]))
+             self.assertTrue(any('possible_fall' in d.events for d in ds), fps)
+ 
+     def test_slow_lying_down_is_not_fall(self):
+@@ -125,20 +125,20 @@
+             wave = math.sin(2*math.pi*.9*t)
+             return pose(t, x=400+30*t+45*wave, angle=20*wave, cfg=c)[0]
+         _, ds = simulate(sway, duration=7)
+-        self.assertTrue(any(d.state == 'unsteady_gait' for d in ds))
++        self.assertTrue(any(d.state == 'possible_postural_sway' for d in ds))
+ 
+     def test_missing_resets_sleep_timer(self):
+         cfg = Config(sleep_still_s=2, bed_polygon=[[.1, .4], [.8, .4], [.8, .8], [.1, .8]])
+         m, _ = simulate(lambda t, c: pose(t, y=600, angle=90, cfg=c)[0], duration=1.9, cfg=cfg)
+         self.assertEqual(m.missing(2).state, 'unknown')
+         ds = [m.update(pose(float(t), y=600, angle=90, cfg=cfg)[0]) for t in np.arange(2.1, 3.5, .05)]
+-        self.assertFalse(any(d.state == 'possible_sleep' for d in ds))
++        self.assertFalse(any(d.state == 'resting_in_bed' for d in ds))
+ 
+     def test_time_gap_does_not_imply_sleep(self):
+         cfg = Config(sleep_still_s=2, bed_polygon=[[.1, .4], [.8, .4], [.8, .8], [.1, .8]])
+         m, _ = simulate(lambda t, c: pose(t, y=600, angle=90, cfg=c)[0], duration=1.9, cfg=cfg)
+         d = m.update(pose(20, y=600, angle=90, cfg=cfg)[0])
+-        self.assertNotEqual(d.state, 'possible_sleep')
++        self.assertNotEqual(d.state, 'resting_in_bed')
+ 
+     def test_bad_pose_is_unknown(self):
+         _, k, b = pose(0)
+--- a/tests/test_floor_lying.py
++++ b/tests/test_floor_lying.py
+@@ -45,11 +45,12 @@
+         _, ds = simulate(lambda t, c: replace(pose(t, y=600, angle=90, cfg=c)[0], floor=True), cfg=cfg)
+         self.assertFalse(any(d.floor_lying_alert_active for d in ds))
+ 
+-    def test_bed_overrides_floor_overlap(self):
++    def test_overlapping_regions_are_ambiguous_not_sleep(self):
+         cfg = replace(self.cfg, bed_polygon=FLOOR, sleep_still_s=.5)
+         _, ds = simulate(lambda t, c: pose(t, y=600, angle=90, cfg=c)[0], cfg=cfg)
+         self.assertFalse(any(d.floor_lying_alert_active for d in ds))
+-        self.assertEqual(ds[-1].state, 'possible_sleep')
++        self.assertTrue(ds[-1].zone_ambiguous)
++        self.assertEqual(ds[-1].state, 'lying')
+ 
+     def test_outside_floor_does_not_trigger(self):
+         cfg = replace(self.cfg, floor_polygon=[[.8,.8],[1,.8],[1,1],[.8,1]])
+--- /dev/null
++++ b/tests/test_hardening.py
+@@ -0,0 +1,120 @@
++from dataclasses import replace
++import unittest
++import numpy as np
++
++from engine import Config,TemporalMonitor,extract_feature
++from frame_health import FrameHealth
++from care_policy import CarePolicy,CareConfig
++from test_engine import pose,simulate
++
++
++class FrameHealthTests(unittest.TestCase):
++    def test_darkness_is_technical_gap_not_sleep(self):
++        h=FrameHealth(dark_s=1,frozen_s=5)
++        black=np.zeros((30,40,3),dtype=np.uint8)
++        self.assertEqual(h.update(0,black),'ok')
++        self.assertEqual(h.update(1,black),'image_too_dark')
++
++    def test_duplicate_frame_triggers_after_threshold(self):
++        h=FrameHealth(dark_s=5,frozen_s=1)
++        image=np.full((20,20,3),128,dtype=np.uint8)
++        self.assertEqual(h.update(0,image),'ok')
++        self.assertEqual(h.update(.5,image),'ok')
++        self.assertEqual(h.update(1,image),'suspected_frozen_image')
++        image[0,0,0]=129
++        self.assertEqual(h.update(1.5,image),'ok')
++
++    def test_resolution_change_requires_recalibration_not_auto_recovery(self):
++        h=FrameHealth()
++        h.update(0,np.full((20,20,3),128,np.uint8))
++        self.assertIn('recalibration',h.update(1,np.full((40,40,3),128,np.uint8)))
++        self.assertIn('recalibration',h.update(2,np.full((20,20,3),128,np.uint8)))
++
++    def test_invalid_image_and_time(self):
++        h=FrameHealth()
++        self.assertEqual(h.update(0,np.zeros((0,0),np.uint8)),'invalid_frame')
++        with self.assertRaises(ValueError):h.update(0,np.ones((3,3),np.uint8))
++
++
++class EngineHardeningTests(unittest.TestCase):
++    def test_invalid_polygon_shapes_and_types(self):
++        polys=[None,True,{},[[0,0],[1,1]],[[0,0],[.5,.5],[1,1]],
++               [[0,0],[1,0],[1,1],[0,0]],[[0,0],[True,0],[1,1]],
++               [[0,0],[1,1],[0,1],[1,0]],
++               [[0,0],[1,.8],[0,1],[.8,0]]]
++        for p in polys:
++            with self.subTest(p=p),self.assertRaises(ValueError):Config(floor_polygon=p).validate()
++
++    def test_all_numeric_config_booleans_rejected(self):
++        for field in ('history_s','keypoint_conf','fall_speed','sleep_still_s','sway_min_reversals'):
++            with self.subTest(field=field),self.assertRaises(ValueError):
++                replace(Config(),**{field:True}).validate()
++
++    def test_out_of_range_confidences_not_accepted(self):
++        _,k,b=pose(0)
++        k[:,2]=1.2
++        self.assertIsNone(extract_feature(0,k,b,(1200,1000),Config()))
++        self.assertIsNone(extract_feature(float('nan'),k,b,(1200,1000),Config()))
++
++    def test_chair_is_not_floor(self):
++        cfg=Config(chair_polygon=[[0,.4],[1,.4],[1,.9],[0,.9]],sleep_still_s=.5)
++        _,ds=simulate(lambda t,c:pose(t,y=600,angle=90,cfg=c)[0],cfg=cfg)
++        self.assertEqual(ds[-1].state,'resting_in_chair')
++        self.assertTrue(ds[-1].in_chair)
++        self.assertFalse(any('prolonged_floor_lying' in d.events for d in ds))
++
++    def test_torso_straddling_bed_floor_is_ambiguous(self):
++        cfg=Config(bed_polygon=[[0,.4],[.3,.4],[.3,.9],[0,.9]],
++                   floor_polygon=[[.3,.4],[1,.4],[1,.9],[.3,.9]])
++        f=pose(0,y=600,angle=90,cfg=cfg)[0]
++        self.assertTrue(f.zone_ambiguous)
++        self.assertFalse(f.bed)
++        self.assertFalse(f.floor)
++
++    def test_no_calibration_cannot_claim_floor_fall(self):
++        def falling(t,c):
++            progress=min(1,max(0,(t-1)/.5))
++            return pose(t,y=320+280*progress,angle=90*progress,cfg=c)[0]
++        _,ds=simulate(falling,duration=6)
++        self.assertFalse(any('possible_fall' in d.events for d in ds))
++        self.assertTrue(any('descent_unconfirmed' in d.events for d in ds))
++
++    def test_fast_descent_to_bed_is_not_silently_safe(self):
++        cfg=Config(bed_polygon=[[0,.4],[1,.4],[1,.9],[0,.9]])
++        p=CarePolicy(CareConfig())
++        def falling(t,c):
++            progress=min(1,max(0,(t-1)/.5))
++            return pose(t,y=320+280*progress,angle=90*progress,cfg=c)[0]
++        _,ds=simulate(falling,duration=6,cfg=cfg)
++        signals=[]
++        for i,d in enumerate(ds):signals+=p.update(i*.05,d)
++        self.assertFalse(any('possible_fall' in d.events for d in ds))
++        self.assertTrue(any(s.family=='safety' and s.priority=='review' for s in signals))
++
++    def test_identity_teleport_is_uncertainty_not_fall(self):
++        cfg=Config()
++        m=TemporalMonitor(cfg)
++        m.update(pose(0,x=300)[0])
++        d=m.update(pose(.1,x=1000)[0])
++        self.assertEqual(d.state,'unknown')
++        self.assertIn('discontinuity',d.reason)
++        self.assertEqual(d.events,[])
++
++    def test_lying_person_moving_arms_is_not_activity_still(self):
++        def moving(t,c):
++            f,k,b=pose(t,y=600,angle=90,cfg=c)
++            k[9,0]+=35*np.sin(t*2*np.pi*2)
++            k[10,0]+=35*np.sin(t*2*np.pi*2)
++            return extract_feature(t,k,b,(1200,1000),c)
++        _,ds=simulate(moving,duration=3)
++        self.assertTrue(any(d.activity=='moving' for d in ds))
++        self.assertTrue(all(d.posture=='lying' for d in ds))
++
++    def test_cyclic_joint_motion_cannot_cancel_to_zero(self):
++        items=[]
++        for i in range(13):
++            f=pose(i*.05)[0]
++            points=f.points.copy()
++            points[9,0]+=80*np.sin(2*np.pi*i/12)
++            items.append(replace(f,points=points))
++        self.assertGreater(TemporalMonitor._joint_motion(items,120,[9]),.15)
+--- /dev/null
++++ b/tests/test_incidents.py
+@@ -0,0 +1,174 @@
++import json
++import os
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++
++from delivery import HTTPSender,NoRedirects,deliver_one
++from incidents import IncidentStore
++
++
++class IncidentTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp=tempfile.TemporaryDirectory()
++        self.path=Path(self.tmp.name)/'events.sqlite3'
++        self.store=IncidentStore(self.path,ack_timeout_s=10,reminder_s=30)
++
++    def tearDown(self):
++        self.store.close()
++        self.tmp.cleanup()
++
++    def event(self,priority='review',scope='room:run:track-1',**kw):
++        return self.store.open(scope,'safety',priority,'test_evidence',now=100,**kw)
++
++    def test_dedup_and_atomic_outbox(self):
++        first=self.event()
++        self.assertEqual(self.event(),first)
++        self.assertEqual(len(self.store.active()),1)
++        self.assertEqual(self.store.delivery_status()['pending'],1)
++
++    def test_rollback_cannot_leave_incident_without_notification(self):
++        with patch.object(self.store,'_notify',side_effect=OSError('disk error')):
++            with self.assertRaises(OSError):self.event()
++        self.assertEqual(self.store.active(),[])
++        self.assertEqual(self.store.delivery_status()['pending'],0)
++
++    def test_survives_process_restart(self):
++        ident=self.event('urgent')
++        self.store.close()
++        self.store=IncidentStore(self.path)
++        self.assertEqual(self.store.get(ident)['status'],'open')
++        self.assertEqual(self.store.delivery_status()['pending'],1)
++        self.assertEqual(self.store.get(ident)['ack_timeout'],10)
++
++    def test_run_scoping_does_not_guess_identity(self):
++        a=self.event(scope='room:runA:track-1')
++        b=self.event(scope='room:runB:track-1')
++        self.assertNotEqual(a,b)
++        self.assertEqual(len(self.store.active()),2)
++
++    def test_priority_upgrade_reopens_acknowledgement(self):
++        ident=self.event()
++        self.store.acknowledge(ident,'operator','checking',101)
++        self.store.open('room:run:track-1','safety','urgent','possible_fall',102)
++        self.assertEqual(self.store.get(ident)['status'],'open')
++        self.assertEqual(self.store.get(ident)['priority'],'urgent')
++
++    def test_new_fall_same_priority_not_swallowed_by_prior_ack(self):
++        ident=self.event('urgent')
++        self.store.acknowledge(ident,'operator','checking',101)
++        self.store.open('room:run:track-1','safety','urgent','new_fall',102,new_evidence=True)
++        self.assertEqual(self.store.get(ident)['status'],'open')
++        self.assertEqual(self.store.delivery_status()['pending'],3)
++
++    def test_ack_is_not_resolution(self):
++        ident=self.event()
++        self.store.acknowledge(ident,'operator','on the way',101)
++        self.assertEqual(len(self.store.active()),1)
++        self.assertEqual(self.store.get(ident)['status'],'acknowledged')
++
++    def test_deadline_escalation_is_not_clinical_evidence(self):
++        ident=self.event()
++        self.store.tick(109.9)
++        self.assertEqual(self.store.get(ident)['priority'],'review')
++        self.store.tick(110.)
++        self.assertEqual(self.store.get(ident)['priority'],'urgent')
++        self.assertEqual(self.store.delivery_status()['pending'],2)
++        self.store.tick(111.)
++        self.assertEqual(self.store.delivery_status()['pending'],2)
++        row=self.store.db.execute('SELECT detail FROM audit ORDER BY seq DESC LIMIT 1').fetchone()
++        self.assertIn('not_clinical_evidence',row['detail'])
++
++    def test_acknowledged_incident_has_resolution_reminder(self):
++        ident=self.event()
++        self.store.acknowledge(ident,'operator','checking',101)
++        self.store.tick(130.)
++        self.assertEqual(self.store.delivery_status()['pending'],2)
++        self.store.tick(131.)
++        self.assertEqual(self.store.get(ident)['status'],'acknowledged')
++        self.assertEqual(self.store.delivery_status()['pending'],3)
++
++    def test_explicit_resolution_and_no_future_escalation(self):
++        ident=self.event()
++        self.store.resolve(ident,'operator','review completed',101)
++        self.store.tick(10000.)
++        self.assertEqual(self.store.active(),[])
++        self.assertEqual(self.store.delivery_status()['pending'],2)
++        self.assertNotEqual(self.event(),ident)
++
++    def test_anonymous_ack_and_empty_resolution_rejected(self):
++        ident=self.event()
++        with self.assertRaises(ValueError): self.store.acknowledge(ident,'','checking',101)
++        with self.assertRaises(ValueError): self.store.resolve(ident,'operator','',101)
++        self.assertEqual(self.store.get(ident)['status'],'open')
++
++    def test_claim_leases_prevent_two_workers_sending_same_item(self):
++        self.event()
++        message=self.store.claim(100.)
++        self.assertIsNotNone(message)
++        other=IncidentStore(self.path)
++        try:self.assertIsNone(other.claim(101.))
++        finally:other.close()
++        renewed=self.store.claim(131.)
++        self.assertEqual(renewed['id'],message['id'])
++        self.assertNotEqual(renewed['lease_token'],message['lease_token'])
++        self.assertFalse(self.store.delivery_result(message['id'],message['lease_token'],True,now=132))
++
++    def test_failed_delivery_retries_same_id_with_backoff(self):
++        self.event()
++        class Fail:
++            def send(self,message):raise TimeoutError('secret URL must not be persisted')
++        self.assertTrue(deliver_one(self.store,Fail(),100.))
++        self.assertIsNone(self.store.claim(101.))
++        message=self.store.claim(102.)
++        self.assertEqual(message['last_error'],'TimeoutError')
++        self.assertEqual(message['attempts'],1)
++        self.assertEqual(json.loads(message['payload'])['notification_id'],message['id'])
++
++    def test_transport_success_not_human_ack(self):
++        ident=self.event()
++        class OK:
++            def send(self,message):return True
++        deliver_one(self.store,OK(),100.)
++        self.assertEqual(self.store.delivery_status()['pending'],0)
++        self.assertEqual(self.store.get(ident)['status'],'open')
++
++    def test_per_incident_delivery_order(self):
++        ident=self.event()
++        self.store.resolve(ident,'operator','checked',101)
++        first=self.store.claim(102.)
++        self.assertEqual(json.loads(first['payload'])['action'],'opened')
++        self.assertIsNone(self.store.claim(103.))
++        self.store.delivery_result(first['id'],first['lease_token'],True,now=103.)
++        last=self.store.claim(104.)
++        self.assertEqual(json.loads(last['payload'])['action'],'resolved')
++
++    def test_stale_heartbeat_opens_durable_health_incident(self):
++        self.store.heartbeat('room','ok',100)
++        self.assertIsNone(self.store.check_heartbeat('room',30,129))
++        ident=self.store.check_heartbeat('room',30,131)
++        self.assertEqual(self.store.get(ident)['family'],'service_health')
++        self.store.heartbeat('room','ok',132)
++        self.assertIsNone(self.store.check_heartbeat('room',30,132))
++        self.assertEqual(self.store.get(ident)['status'],'open')
++
++    def test_missing_and_stopped_heartbeat_alert(self):
++        self.assertIsNotNone(self.store.check_heartbeat('room',now=100))
++        self.store.heartbeat('other','stopped',100)
++        self.assertIsNotNone(self.store.check_heartbeat('other',now=101))
++
++    @unittest.skipIf(os.name=='nt','POSIX permissions only')
++    def test_new_store_has_restrictive_permissions(self):
++        self.assertEqual(self.path.stat().st_mode & 0o777,0o600)
++
++    def test_https_and_no_credentials_in_url(self):
++        for url in ('http://example.com','https://u:p@example.com','https://example.com#fragment','https://example.com?key=secret'):
++            with self.assertRaises(ValueError):HTTPSender(url,'token')
++        with self.assertRaises(ValueError):HTTPSender('https://example.com','')
++        self.assertIsNotNone(HTTPSender('https://example.com/events','token'))
++        self.assertIsNone(NoRedirects().redirect_request(None,None,302,'',{},'https://other.test'))
++
++    def test_invalid_clock_and_deadline_rejected(self):
++        with self.assertRaises(ValueError):self.store.tick(float('nan'))
++        with self.assertRaises(ValueError):IncidentStore(self.path,ack_timeout_s=True)
+--- /dev/null
++++ b/tests/test_integrated_care.py
+@@ -0,0 +1,108 @@
++"""Real OpenCV file I/O with fake pose model. No live network or neural validation."""
++import contextlib
++import csv
++from dataclasses import asdict
++import io
++import json
++from pathlib import Path
++import sys
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++import numpy as np
++from care_policy import CareConfig
++from engine import Config,Decision
++from incidents import IncidentStore
++from monitor import CSVLogger,CSV_FIELDS,parser,run
++from test_floor_pipeline import FloorYOLO
++from test_pipeline import FakeYOLO,Boxes,Tensor,cv2
++
++
++class NoPeople:
++    task='pose'
++    def __init__(self,*a):pass
++    def predict(self,*a,**k):return []
++    def track(self,*a,**k):
++        return [types.SimpleNamespace(boxes=Boxes([]),keypoints=types.SimpleNamespace(data=Tensor([])))]
++
++
++@unittest.skipIf(cv2 is None,'OpenCV unavailable')
++class IntegratedCareTests(unittest.TestCase):
++    def exercise(self,model,cfg=None,care=None,extra=None,frames=60):
++        with tempfile.TemporaryDirectory() as folder:
++            root=Path(folder)
++            video=root/'input.avi';log=root/'log.csv';database=root/'incidents.sqlite3'
++            writer=cv2.VideoWriter(str(video),cv2.VideoWriter_fourcc(*'MJPG'),20,(640,480))
++            if not writer.isOpened():self.skipTest('MJPG unavailable')
++            for _ in range(frames):writer.write(np.zeros((480,640,3),np.uint8))
++            writer.release()
++            cfgpath=root/'config.json';carepath=root/'care.json'
++            cfgpath.write_text(json.dumps(asdict(cfg or Config())))
++            carepath.write_text(json.dumps(asdict(care or CareConfig())))
++            args=parser().parse_args(['--source',str(video),'--csv',str(log),'--incident-db',str(database),
++                                     '--config',str(cfgpath),'--care-config',str(carepath),'--imgsz','640']+(extra or []))
++            with patch.dict(sys.modules,{'ultralytics':types.SimpleNamespace(YOLO=model,__version__='MOCK_ONLY')}),contextlib.redirect_stdout(io.StringIO()):
++                self.assertEqual(run(args),0)
++            store=IncidentStore(database)
++            try:
++                incidents=store.active()
++                status=store.delivery_status()
++            finally:store.close()
++            with log.open(encoding='utf-8-sig') as f:rows=list(csv.DictReader(f))
++            return incidents,status,rows
++
++    def test_floor_incident_survives_vision_exit(self):
++        cfg=Config(floor_polygon=[[0,.4],[1,.4],[1,.9],[0,.9]],floor_lying_alert_s=.5)
++        incidents,status,rows=self.exercise(FloorYOLO,cfg)
++        self.assertEqual(len(incidents),1)
++        self.assertEqual(incidents[0]['family'],'safety')
++        self.assertEqual(incidents[0]['status'],'open')
++        self.assertEqual(status['pending'],1)
++        self.assertTrue(any(r['event']=='floor_lying_monitor_stopped' for r in rows))
++
++    def test_expected_empty_scene_uses_approved_policy(self):
++        care=CareConfig(care_plan_id='TEST',expected_presence=True,coverage_checkin_s=.5)
++        incidents,status,rows=self.exercise(NoPeople,care=care)
++        self.assertEqual([x['family'] for x in incidents],['expected_presence'])
++
++    def test_empty_scene_without_expectation_no_person_alarm(self):
++        incidents,_,_=self.exercise(NoPeople)
++        self.assertEqual(incidents,[])
++
++    def test_dark_video_generates_technical_incident_not_medical_event(self):
++        incidents,_,rows=self.exercise(FakeYOLO,extra=['--check-frame-health'],frames=130)
++        self.assertEqual([x['family'] for x in incidents],['frame_health'])
++        self.assertIn('image_too_dark',incidents[0]['reason'])
++        self.assertTrue(any(r['event']=='frame_health_changed' and r['reason']=='image_too_dark' for r in rows))
++        self.assertFalse(any(r['event']=='possible_fall' for r in rows))
++
++    def test_inactivity_reaches_persistent_review_incident(self):
++        # A stationary standing pose outside rest zones; synthetic inference only.
++        care=CareConfig(care_plan_id='TEST',inactivity_enabled=True,nonrest_checkin_s=.5)
++        incidents,_,_=self.exercise(FakeYOLO,care=care)
++        self.assertTrue(any(x['family']=='inactivity' and x['priority']=='review' for x in incidents))
++
++
++class LoggingTests(unittest.TestCase):
++    def test_rotation_bounds_files_and_keeps_headers(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path=Path(folder)/'events.csv'
++            log=CSVLogger(str(path),'test','video_relative',max_bytes=1024,backups=2)
++            for i in range(30):log.write(i,i,1,'sample',Decision(reason='x'*300))
++            log.close()
++            files=list(Path(folder).glob('events.csv*'))
++            self.assertEqual(len(files),3)
++            for file in files:
++                with file.open(encoding='utf-8-sig') as f:self.assertEqual(next(csv.reader(f)),CSV_FIELDS)
++                self.assertLess(file.stat().st_size,2000)
++
++    def test_rotation_validation(self):
++        with tempfile.TemporaryDirectory() as folder:
++            with self.assertRaises(ValueError):CSVLogger(str(Path(folder)/'x.csv'),'run','test',max_bytes=0)
++
++    def test_nonfinite_cli_arguments_fail_before_model_import(self):
++        for arg in ('--stream-timeout','--max-seconds','--video-fps','--max-frame-age'):
++            args=parser().parse_args([arg,'nan'])
++            with self.subTest(arg=arg),self.assertRaises(ValueError):run(args)

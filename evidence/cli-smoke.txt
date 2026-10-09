@@ -1,0 +1,27 @@
+[
+  {
+    "id": "294653c37ad04aea937c05784ab4d6bc",
+    "scope": "TEST:run:track1",
+    "family": "safety",
+    "priority": "review",
+    "status": "open",
+    "opened": 1788850722.8724139,
+    "updated": 1788850722.8724139,
+    "next_action": 1788850782.8724139,
+    "reason": "synthetic_cli_smoke",
+    "ack_timeout": 60.0,
+    "reminder": 300.0
+  }
+]
+
+Recorded. Acknowledgement is not resolution; visual movement is not medical clearance.
+
+Recorded. Acknowledgement is not resolution; visual movement is not medical clearance.
+
+{
+  "pending": 3,
+  "max_attempts": 0
+}
+
+{"pending": 3, "max_attempts": 0}
+NO DELIVERY CONFIGURED: incidents remain queued locally; no caregiver is notified.

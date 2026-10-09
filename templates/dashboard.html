@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پایش سالمند | داشبورد</title>
+<style>
+:root{--bg:#0d1321;--card:#182236;--card2:#101a2e;--line:#2b3a5c;--txt:#eaf0f9;--mut:#94a3c0;
+--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
+*{box-sizing:border-box;font-family:Vazirmatn,Tahoma,Segoe UI,Arial,sans-serif}
+body{margin:0;background:radial-gradient(1200px 400px at 80% -50px,#1b2b4d 0%,var(--bg) 60%) fixed,var(--bg);color:var(--txt)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;
+padding:13px 22px;background:rgba(11,18,32,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.brand{display:flex;gap:12px;align-items:center}
+.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#0ea5e9,#6366f1);
+display:flex;align-items:center;justify-content:center;font-size:22px}
+header h1{font-size:18px;margin:0}
+header small{display:block;color:var(--mut);font-size:11.5px;margin-top:2px}
+.pill{display:flex;align-items:center;gap:8px;padding:7px 16px;border-radius:20px;font-size:13px;background:#26314d}
+.dot{width:10px;height:10px;border-radius:50%;background:#64748b}
+.pill.run{background:#052e22;color:var(--ok)}.pill.run .dot{background:var(--ok);animation:bl 1.4s infinite}
+.pill.warn{background:#3a2a05;color:var(--warn)}.pill.warn .dot{background:var(--warn);animation:bl 1.4s infinite}
+.pill.err{background:#450a0a;color:var(--bad)}.pill.err .dot{background:var(--bad)}
+@keyframes bl{50%{opacity:.35}}
+main{max-width:1280px;margin:0 auto;padding:18px;display:grid;gap:16px}
+.grid2{display:grid;grid-template-columns:2fr 1fr;gap:16px}
+@media(max-width:960px){.grid2{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);
+border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+.card h2{font-size:14.5px;margin:0 0 12px;color:var(--acc);display:flex;justify-content:space-between;align-items:center}
+.livewrap{position:relative}
+#live{width:100%;border-radius:12px;background:#000;min-height:280px;display:block}
+#liveMsg{position:absolute;inset:auto 12px 12px 12px;background:rgba(5,10,20,.82);border:1px solid var(--line);
+border-radius:10px;padding:10px 14px;font-size:13px;display:none}
+#liveMsg.err{border-color:var(--bad);color:var(--bad)}
+.tools{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:#0c1528;border:1px solid var(--line);border-radius:12px;padding:12px 8px;text-align:center}
+.stat b{font-size:23px;display:block}
+.stat span{font-size:11.5px;color:var(--mut)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:right}
+th{color:var(--mut);font-weight:normal;font-size:12px}
+.urgent{color:var(--bad);font-weight:bold}.review{color:var(--warn)}
+button{background:var(--acc);border:0;border-radius:9px;padding:9px 16px;cursor:pointer;
+color:#03222f;font-weight:bold;font-size:13px}
+button.ghost{background:transparent;border:1px solid var(--acc);color:var(--acc)}
+button.danger{background:transparent;border:1px solid var(--bad);color:var(--bad)}
+button.sm{padding:5px 12px;font-size:12px}
+input,select{width:100%;background:#0c1528;border:1px solid var(--line);color:var(--txt);
+border-radius:9px;padding:9px;margin:4px 0 10px;font-size:13px}
+label{font-size:12px;color:var(--mut)}
+pre{background:#080e1c;border:1px solid var(--line);border-radius:10px;padding:12px;
+font-size:11px;max-height:240px;overflow:auto;direction:ltr;text-align:left;color:#c4d2e8}
+.ev{display:flex;flex-wrap:wrap;gap:8px}
+.ev span{background:#0c1528;border:1px solid var(--line);border-radius:8px;padding:5px 11px;font-size:12px}
+.ev .hot{border-color:var(--bad);color:var(--bad)}
+#chart{width:100%;height:150px;background:#0c1528;border:1px solid var(--line);border-radius:10px}
+footer{text-align:center;color:var(--mut);font-size:11.5px;padding:18px;line-height:2}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:10}
+#modal .box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px;width:350px}
+#mErr{color:var(--bad);font-size:12px;min-height:18px}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#450a0a;color:#fecaca;
+border:1px solid var(--bad);border-radius:10px;padding:10px 20px;font-size:13px;display:none;z-index:20}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--mut);margin-top:8px}
+.legend i{width:11px;height:11px;border-radius:3px;display:inline-block;margin-left:5px}
+</style>
+</head>
+<body>
+<header>
+<div class="brand"><div class="logo">🏠</div>
+<div><h1>سامانه پایش سالمند</h1><small>نمونه مهندسی — تشخیص پزشکی نیست؛ فقط درخواست بررسی می‌سازد</small></div></div>
+<div id="pill" class="pill"><span class="dot"></span><span id="pillTxt">⏳ در حال اتصال…</span></div>
+</header>
+<main>
+<div class="grid2">
+<div class="card"><h2>📹 پخش زنده <span id="fpsTag" style="font-size:11px;color:var(--mut)"></span></h2>
+<div class="livewrap"><img id="live" src="/video_feed" alt="پخش زنده"><div id="liveMsg"></div></div>
+<div class="tools">
+<a href="/api/snapshot" download="snapshot.jpg"><button class="ghost sm">📸 ثبت عکس فوری</button></a>
+<a href="/api/csv-download" download="monitor.csv"><button class="ghost sm">📥 دانلود لاگ CSV</button></a>
+<button class="ghost sm" onclick="ctl('stop')">⏹ توقف پایش</button>
+<button class="sm" onclick="restart()">▶️ شروع مجدد</button>
+</div>
+<div class="ev" id="events" style="margin-top:10px"></div></div>
+<div>
+<div class="card"><h2>⚙️ وضعیت سیستم</h2><div class="stats">
+<div class="stat"><b id="sFps">–</b><span>فریم بر ثانیه</span></div>
+<div class="stat"><b id="sTr">–</b><span>نفر رهگیری‌شده</span></div>
+<div class="stat"><b id="sH">–</b><span>سلامت تصویر</span></div>
+<div class="stat"><b id="sSt">–</b><span>وضعیت موتور</span></div>
+</div><div id="cur" style="font-size:12px;color:var(--mut);margin-top:10px">…</div></div>
+<div class="card" style="margin-top:16px"><h2>📊 وضعیت‌ها در ۵ دقیقه اخیر</h2>
+<canvas id="chart" width="600" height="150"></canvas>
+<div class="legend" id="legend"></div></div>
+</div>
+</div>
+<div class="card"><h2>🚨 پرونده‌های باز <button class="ghost sm" onclick="loadInc()">↻ تازه‌سازی</button></h2>
+<table><thead><tr><th>شناسه</th><th>خانواده</th><th>اولویت</th><th>وضعیت</th><th>علت</th><th>عملیات</th></tr></thead>
+<tbody id="incBody"><tr><td colspan="6">…</td></tr></tbody></table></div>
+<div class="grid2">
+<div class="card"><h2>📦 وضعیت ارسال</h2><div id="deliv">…</div>
+<div style="font-size:11.5px;color:var(--mut);margin-top:8px">پایش به‌تنهایی پیامک/تماس نمی‌فرستد؛ ارسال به سامانه مراقب نیازمند worker جداگانه است.</div></div>
+<div class="card"><h2>⚙️ تنظیمات <button class="ghost sm" onclick="saveSettings()">💾 ذخیره و شروع مجدد</button></h2>
+<label>منبع (0 = وبکم، یا مسیر فایل ویدیو)</label><input id="sSrc" value="0">
+<label>مدل (n سبک‌تر و سریع‌تر است)</label><select id="sModel"><option>yolo11n-pose.pt</option><option>yolo11s-pose.pt</option></select>
+<label>اندازه تصویر (کوچک‌تر = سریع‌تر)</label><select id="sImg"><option>320</option><option>480</option><option>640</option><option>960</option></select>
+<label>حساسیت تشخیص (۰ تا ۱)</label><input id="sConf" value="0.20"></div>
+</div>
+<div class="grid2">
+<div class="card"><h2>🧾 آخرین تصمیم‌های موتور</h2><pre id="csv">…</pre></div>
+<div class="card"><h2>🔧 پیکربندی موتور</h2><pre id="cfg">…</pre></div>
+</div>
+</main>
+<footer>تأیید دریافت (ACK) با بستن پرونده فرق دارد • پایان وضعیت روی تصویر به معنی رفع خطر نیست<br>
+در وضعیت خطر واقعی منتظر نرم‌افزار نمانید و تنها به این سامانه تکیه نکنید</footer>
+<div id="modal"><div class="box"><h3 id="mTitle" style="margin-top:0">رسیدگی</h3>
+<label>نام اپراتور</label><input id="mOp" placeholder="مثلاً caregiver01">
+<label>یادداشت (نتیجه واقعی، بدون اطلاعات حساس)</label><input id="mNote" placeholder="بررسی حضوری انجام شد…">
+<div id="mErr"></div>
+<div style="display:flex;gap:8px;margin-top:8px">
+<button id="mOk">ثبت</button><button class="ghost" onclick="modal(false)">انصراف</button></div></div></div>
+<div id="toast"></div>
+<script>
+let mId=null,mOp=null;
+const COLORS={standing:'#38bdf8',sitting:'#a78bfa',walking:'#34d399',lying:'#f87171',unknown:'#64748b'};
+async function j(u,o){let r=await fetch(u,o);let t=await r.json().catch(()=>({}));if(!r.ok)throw new Error(t.error||('خطا '+r.status));return t}
+function modal(on){document.getElementById('modal').style.display=on?'flex':'none';document.getElementById('mErr').textContent=''}
+function toast(m){let t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',5000)}
+async function status(){try{let s=await j('/api/status');let st=s.stats;
+document.getElementById('sFps').textContent=st.fps??'–';
+document.getElementById('sTr').textContent=st.tracks??'–';
+document.getElementById('sH').textContent=st.fa_health||st.health||'–';
+document.getElementById('sSt').textContent=st.fa_state||st.state||'–';
+document.getElementById('fpsTag').textContent=st.fps?st.fps+' فریم/ثانیه':'';
+let cur=Object.entries(st.fa_states||{}).map(([k,v])=>k+' ×'+v).join('، ');
+document.getElementById('cur').textContent=cur?('الان: '+cur):'نفری دیده نمی‌شود';
+let pill=document.getElementById('pill'),txt=document.getElementById('pillTxt'),msg=document.getElementById('liveMsg');
+if(st.state==='running'){pill.className='pill run';txt.textContent='● در حال پایش';msg.style.display='none'}
+else if(st.state==='error'){pill.className='pill err';txt.textContent='✖ خطا';
+msg.className='err';msg.style.display='block';msg.id='liveMsg';
+msg.textContent='⚠️ '+(st.fa_error||st.error);}
+else{pill.className='pill warn';txt.textContent='⏳ '+(st.fa_state||st.state);
+msg.style.display='block';msg.className='';msg.id='liveMsg';
+msg.textContent='⏳ '+(st.fa_state||'در حال آماده‌سازی…')+' — لطفاً چند ثانیه صبر کنید (بار اول تا ۳۰ ثانیه).';}
+document.getElementById('events').innerHTML=(st.events||[]).slice(-8).reverse()
+.map(e=>`<span class="${/fall|prolonged/.test(e.event)?'hot':''}">${e.fa||e.event} • ${e.t}s</span>`).join('')||'<span>رویدادی نیست</span>';
+}catch(e){}}
+async function loadInc(){try{let rows=await j('/api/incidents');
+document.getElementById('incBody').innerHTML=rows.length?rows.map(r=>
+`<tr><td style="direction:ltr">${r.id.slice(0,8)}…</td><td>${r.family}</td>
+<td class="${r.priority}">${r.fa_priority||r.priority}</td><td>${r.fa_status||r.status}</td>
+<td style="font-size:11px;direction:ltr;text-align:left">${(r.reason||'').slice(0,60)}</td>
+<td style="white-space:nowrap"><button class="sm" onclick="ask('${r.id}','ack')">تأیید</button> <button class="sm danger" onclick="ask('${r.id}','resolve')">بستن</button></td></tr>`).join('')
+:'<tr><td colspan="6">پرونده بازی نیست ✔</td></tr>';
+}catch(e){}}
+function ask(id,op){mId=id;mOp=op;document.getElementById('mTitle').textContent=op==='ack'?'تأیید دریافت':'بستن پرونده';modal(true)}
+document.getElementById('mOk').onclick=async()=>{let op=document.getElementById('mOp').value.trim(),
+note=document.getElementById('mNote').value.trim();
+if(!op||!note){document.getElementById('mErr').textContent='نام اپراتور و یادداشت لازم است.';return}
+try{await j('/api/incidents/'+mId+'/'+mOp,{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({operator:op,note:note})});modal(false);loadInc();}catch(e){document.getElementById('mErr').textContent=e.message}};
+async function restart(){try{await j('/api/worker/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){toast(e.message)}status()}
+async function ctl(a){try{await j('/api/worker/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){toast(e.message)}status()}
+async function saveSettings(){try{await j('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({source:document.getElementById('sSrc').value,model:document.getElementById('sModel').value,
+imgsz:document.getElementById('sImg').value,conf:document.getElementById('sConf').value})});toast('ذخیره شد و پایش دوباره شروع شد ✔');
+setTimeout(()=>location.reload(),1200);}catch(e){toast(e.message)}}
+async function misc(){try{let d=await j('/api/delivery-status');
+document.getElementById('deliv').innerHTML=`در صف: <b>${d.pending}</b> • بیشترین تلاش: <b>${d.max_attempts}</b>`;
+let c=await j('/api/csv-tail');document.getElementById('csv').textContent=(c.rows||[]).join('\n')||'(هنوز لاگی نیست)';
+let g=await j('/api/config');document.getElementById('cfg').textContent=JSON.stringify(g,null,1).slice(0,2500);
+let s=await j('/api/settings');document.getElementById('sSrc').value=s.source??'0';
+document.getElementById('sModel').value=s.model??'yolo11n-pose.pt';
+document.getElementById('sImg').value=String(s.imgsz??480);document.getElementById('sConf').value=s.conf??0.20;
+}catch(e){}}
+async function chart(){try{let s=await j('/api/status');let h=s.history||[];
+let cv=document.getElementById('chart'),x=cv.getContext('2d');x.clearRect(0,0,cv.width,cv.height);
+let keys=[...new Set(h.flatMap(p=>Object.keys(p.counts||{})))];
+document.getElementById('legend').innerHTML=keys.map(k=>
+`<span><i style="background:${COLORS[k]||'#e2e8f0'}"></i>${k}</span>`).join('')||'داده‌ای نیست';
+if(!h.length)return;
+let mx=Math.max(1,...h.map(p=>Math.max(0,...Object.values(p.counts||{0:0}))));
+keys.forEach(k=>{x.strokeStyle=COLORS[k]||'#e2e8f0';x.lineWidth=2;x.beginPath();
+h.forEach((p,i)=>{let px=8+i*(cv.width-16)/Math.max(1,h.length-1);
+let py=cv.height-10-((p.counts||{})[k]||0)/mx*(cv.height-24);
+i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()});
+}catch(e){}}
+status();loadInc();misc();chart();
+setInterval(status,2000);setInterval(loadInc,5000);setInterval(misc,10000);setInterval(chart,5000);
+</script>
+</body>
+</html>

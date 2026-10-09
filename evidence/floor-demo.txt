@@ -1,0 +1,24 @@
+{
+  "source_seconds": 30.0,
+  "state": "prolonged_floor_lying",
+  "posture": "lying",
+  "activity": "unknown",
+  "events": [
+    "prolonged_floor_lying"
+  ],
+  "reason": "temporal_heuristic_not_calibrated;floor_lying_observed_s=30.000;floor_lying_alert_unresolved",
+  "pose_quality": 0.95,
+  "torso_angle_deg": 90.0,
+  "knee_angle_deg": 180.0,
+  "hip_speed": 0.0,
+  "motion_speed": null,
+  "sway_amplitude": 0.0,
+  "in_bed": false,
+  "in_floor": true,
+  "floor_lying_observed_s": 30.0,
+  "floor_lying_alert_active": true,
+  "in_chair": false,
+  "zone_ambiguous": false,
+  "fall_alert_active": false
+}
+Synthetic demo passed. No real person or model was evaluated.

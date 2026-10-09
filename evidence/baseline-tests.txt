@@ -1,0 +1,58 @@
+test_bad_pose_is_unknown (test_engine.EngineTests.test_bad_pose_is_unknown) ... ok
+test_bad_time_raises (test_engine.EngineTests.test_bad_time_raises) ... ok
+test_csv_append_header_and_precision (test_engine.EngineTests.test_csv_append_header_and_precision) ... ok
+test_explicit_floor_region_gate (test_engine.EngineTests.test_explicit_floor_region_gate) ... ok
+test_fall_at_different_frame_rates (test_engine.EngineTests.test_fall_at_different_frame_rates) ... ok
+test_floor_region_excludes_bed (test_engine.EngineTests.test_floor_region_excludes_bed) ... ok
+test_legs_occluded_no_standing_guess (test_engine.EngineTests.test_legs_occluded_no_standing_guess) ... ok
+test_lying_not_fall (test_engine.EngineTests.test_lying_not_fall) ... ok
+test_missing_resets_sleep_timer (test_engine.EngineTests.test_missing_resets_sleep_timer) ... ok
+test_moving_on_bed_is_not_sleep (test_engine.EngineTests.test_moving_on_bed_is_not_sleep) ... ok
+test_no_cross_person_state (test_engine.EngineTests.test_no_cross_person_state) ... ok
+test_polygon_and_config_validation (test_engine.EngineTests.test_polygon_and_config_validation) ... ok
+test_rapid_fall_detected_once (test_engine.EngineTests.test_rapid_fall_detected_once) ... ok
+test_sitting (test_engine.EngineTests.test_sitting) ... ok
+test_sleep_disabled_without_bed (test_engine.EngineTests.test_sleep_disabled_without_bed) ... ok
+test_sleep_proxy_with_bed (test_engine.EngineTests.test_sleep_proxy_with_bed) ... ok
+test_slow_lying_down_is_not_fall (test_engine.EngineTests.test_slow_lying_down_is_not_fall) ... ok
+test_standing (test_engine.EngineTests.test_standing) ... ok
+test_time_gap_does_not_imply_sleep (test_engine.EngineTests.test_time_gap_does_not_imply_sleep) ... ok
+test_unsteady_sway (test_engine.EngineTests.test_unsteady_sway) ... ok
+test_walking (test_engine.EngineTests.test_walking) ... ok
+test_ambiguous_posture_does_not_clear_alert (test_floor_lying.FloorLyingTests.test_ambiguous_posture_does_not_clear_alert) ... ok
+test_ambiguous_posture_resets_pending (test_floor_lying.FloorLyingTests.test_ambiguous_posture_resets_pending) ... ok
+test_bad_missing_timestamp_does_not_mutate_alert (test_floor_lying.FloorLyingTests.test_bad_missing_timestamp_does_not_mutate_alert) ... ok
+test_bed_overrides_floor_overlap (test_floor_lying.FloorLyingTests.test_bed_overrides_floor_overlap) ... ok
+test_default_threshold (test_floor_lying.FloorLyingTests.test_default_threshold) ... ok
+test_disabled_without_calibrated_floor (test_floor_lying.FloorLyingTests.test_disabled_without_calibrated_floor) ... ok
+test_fall_event_not_delayed_by_new_threshold (test_floor_lying.FloorLyingTests.test_fall_event_not_delayed_by_new_threshold) ... ok
+test_implicit_gap_resets_pending (test_floor_lying.FloorLyingTests.test_implicit_gap_resets_pending) ... ok
+test_invalid_threshold_rejected (test_floor_lying.FloorLyingTests.test_invalid_threshold_rejected) ... ok
+test_leaving_floor_does_not_clear_alert (test_floor_lying.FloorLyingTests.test_leaving_floor_does_not_clear_alert) ... ok
+test_missing_breaks_upright_confirmation (test_floor_lying.FloorLyingTests.test_missing_breaks_upright_confirmation) ... ok
+test_missing_preserves_existing_alert_without_duplicate (test_floor_lying.FloorLyingTests.test_missing_preserves_existing_alert_without_duplicate) ... ok
+test_missing_resets_pending (test_floor_lying.FloorLyingTests.test_missing_resets_pending) ... ok
+test_movement_does_not_mean_safe (test_floor_lying.FloorLyingTests.test_movement_does_not_mean_safe) ... ok
+test_one_event_not_every_frame (test_floor_lying.FloorLyingTests.test_one_event_not_every_frame) ... ok
+test_outside_floor_does_not_trigger (test_floor_lying.FloorLyingTests.test_outside_floor_does_not_trigger) ... ok
+test_per_track_isolation (test_floor_lying.FloorLyingTests.test_per_track_isolation) ... ok
+test_single_upright_frame_not_resolution (test_floor_lying.FloorLyingTests.test_single_upright_frame_not_resolution) ... ok
+test_stable_upright_ends_episode_and_rearms (test_floor_lying.FloorLyingTests.test_stable_upright_ends_episode_and_rearms) ... ok
+test_start_on_floor_no_fall_history (test_floor_lying.FloorLyingTests.test_start_on_floor_no_fall_history) ... ok
+test_sustained_sitting_ends_visual_episode (test_floor_lying.FloorLyingTests.test_sustained_sitting_ends_visual_episode) ... ok
+test_upright_and_sitting_do_not_trigger (test_floor_lying.FloorLyingTests.test_upright_and_sitting_do_not_trigger) ... ok
+test_varied_fps (test_floor_lying.FloorLyingTests.test_varied_fps) ... ok
+test_disabled_warning_and_no_alert (test_floor_pipeline.FloorPipelineTests.test_disabled_warning_and_no_alert) ... ok
+test_event_csv_console_and_shutdown (test_floor_pipeline.FloorPipelineTests.test_event_csv_console_and_shutdown) ... ok
+test_tracking_expiry_not_silent_resolution (test_floor_pipeline.FloorPipelineTests.test_tracking_expiry_not_silent_resolution) ... ok
+test_file_video_to_csv_with_mocked_pose_inference (test_pipeline.PipelineTests.test_file_video_to_csv_with_mocked_pose_inference) ... ok
+
+----------------------------------------------------------------------
+Ran 48 tests in 2.574s
+
+OK
+EXPERIMENTAL: posture/motion heuristics; no medical diagnosis or accuracy guarantee.
+possible_sleep DISABLED: no bed_polygon configured.
+WARNING: floor region is not configured; fall location is ambiguous.
+prolonged_floor_lying DISABLED: configure floor_polygon first.
+CSV: /tmp/tmpoiyioq9z/out.csv

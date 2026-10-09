@@ -1,0 +1,14 @@
+{
+  "source": "0",
+  "model": "yolo11n-pose.pt",
+  "device": "cpu",
+  "imgsz": 480,
+  "conf": 0.2,
+  "config": "config.json",
+  "care_config": "care_config.json",
+  "csv": "logs/web.csv",
+  "incident_db": "logs/web.sqlite3",
+  "site_id": "room01",
+  "show_width": 1280,
+  "port": 5000
+}

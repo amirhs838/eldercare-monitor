@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+# Model weights (auto-downloaded on first run by ultralytics, ~6-20MB each)
+*.pt
+# Runtime outputs: logs, databases, recordings, snapshots
+logs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.csv
+snapshots/
+*.mp4
+*.avi
